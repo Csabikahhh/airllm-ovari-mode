@@ -1,6 +1,7 @@
 ![airllm_logo](https://github.com/lyogavin/airllm/blob/main/assets/airllm_logo_sm.png?v=3&raw=true)
 
 [**Quickstart**](#quickstart) | 
+[**Local UI**](#local-ui-chat-and-coding-agent) |
 [**Configurations**](#configurations) | 
 [**MacOS**](#macos) | 
 [**Example notebooks**](#example-python-notebook) | 
@@ -60,6 +61,7 @@
 ## Table of Contents
 
 * [Quick start](#quickstart)
+* [Local UI, Chat and Coding Agent](#local-ui-chat-and-coding-agent)
 * [Model Compression](#model-compression---3x-inference-speed-up)
 * [Configurations](#configurations)
 * [Run on MacOS](#macos)
@@ -122,6 +124,91 @@ print(output)
 Note: During inference, the original model will first be decomposed and saved layer-wise. Please ensure there is sufficient disk space in the huggingface cache directory.
  
 
+## Local UI, Chat and Coding Agent
+
+This fork also includes a responsive local browser UI built with React, Vite,
+Tailwind, and shadcn/ui-style components. It can run AirLLM locally, expose a
+ChatUI, start a review-only coding agent, and connect to external
+OpenAI-compatible AI providers.
+
+Start the backend and production UI:
+
+```powershell
+.\.venv\Scripts\python.exe airllm_ui.py
+```
+
+Open `http://127.0.0.1:7860`.
+
+The UI includes:
+
+* hardware-aware defaults for CUDA/CPU, dtype, prefetching, and sequence length
+* diagnostics for CUDA, RAM, Hugging Face cache disk space, Windows power mode,
+  WiFi link, PyTorch, and bitsandbytes
+* a local benchmark button for GPU/CPU matrix throughput and cache disk read/write
+* responsive mobile-to-desktop layout with stacked panels and full-width mobile actions
+* supported AirLLM model presets plus custom Hugging Face model IDs or local paths
+  including Qwen2.5 Coder 3B/7B presets for local coding-agent use
+* performance controls for `cleanup_interval`, `prefetch_workers`, and the
+  compatibility-only `reinitialize_model_each_forward` mode
+* ChatUI backed by the selected local model or external provider
+* one-button Coding Agent mode that reads workspace context and returns a plan,
+  proposed changes, and test suggestions without automatically editing files
+* external AI provider mode for OpenAI-compatible `/v1/chat/completions` APIs,
+  including services such as OpenAI, OpenRouter, Groq, Together AI, Mistral AI,
+  LM Studio, and Ollama-compatible local servers
+* a Stop button for interrupting local AirLLM generation through Transformers
+  stopping criteria
+
+For frontend development:
+
+```powershell
+cd ui
+npm install
+npm run dev
+```
+
+See [README_UI.md](README_UI.md) for the full UI, ChatUI, Coding Agent, and
+external provider setup notes.
+
+### Local performance changes in this fork
+
+This fork also includes runtime fixes aimed at better laptop/desktop hardware
+usage:
+
+* AirLLM no longer rebuilds the meta model on every `forward()` by default.
+  Set `reinitialize_model_each_forward=True` only if a specific architecture
+  needs the older compatibility behavior.
+* CUDA/Python memory cleanup is now throttled by `cleanup_interval` instead of
+  forcing `gc.collect()` and `torch.cuda.empty_cache()` after every layer.
+  The UI recommends `4` for CUDA systems and keeps `1` available for safer,
+  lower-memory fallback runs.
+* Prefetch pinned-memory now assigns the pinned tensors back into the state dict,
+  so the prefetch path can actually benefit from page-locked CPU memory.
+* Transformers `DynamicCache` is used for modern rotary decoder models when
+  `use_cache=True`; unsupported/batched cases fall back to cache-free inference.
+* The package installer no longer performs a post-install `pip install --upgrade
+  transformers`, making environments more reproducible.
+* `requirements.txt` now uses version ranges instead of old git-main pins.
+  `bitsandbytes` is documented as optional because Windows/CUDA wheel support
+  depends on the exact Python and CUDA combination.
+
+Recommended defaults for this machine class:
+
+* Device: `cuda:0`
+* dtype: `float16`
+* compression: `none` until a compatible `bitsandbytes` wheel is installed
+* prefetching: `on`
+* cleanup interval: `4`
+* prefetch workers: `1`
+* max sequence length: `1024` for 8 GB class GPUs, lower it to `512` if you hit
+  VRAM pressure
+* Hugging Face/layer cache: place `HF_HOME` or `layer_shards_saving_path` on the
+  fastest NVMe SSD with plenty of free space
+* Windows power mode: use a performance profile while benchmarking or running
+  long generations; Balanced can throttle sustained CPU/GPU work
+* Network: prefer the strongest WiFi 6/7 or wired link for first model downloads
+
+
 ## Model Compression - 3x Inference Speed Up!
 
 We just added model compression based on block-wise quantization-based model compression. Which can further **speed up the inference speed** for up to **3x** , with **almost ignorable accuracy loss!** (see more performance evaluation and why we use block-wise quantization in [this paper](https://arxiv.org/abs/2212.09720))
@@ -155,6 +242,9 @@ When initialize the model, we support the following configurations:
 * **layer_shards_saving_path**: optionally another path to save the splitted model
 * **hf_token**: huggingface token can be provided here if downloading gated models like: *meta-llama/Llama-2-7b-hf*
 * **prefetching**: prefetching to overlap the model loading and compute. By default, turned on. For now, only AirLLMLlama2 supports this.
+* **cleanup_interval**: how often AirLLM runs deeper memory cleanup while streaming layers. `1` matches the original conservative behavior; `4` is the UI default for CUDA systems to reduce allocator churn.
+* **prefetch_workers**: number of background layer-load workers. `1` is usually best because layer order is sequential and avoids SSD/RAM contention.
+* **reinitialize_model_each_forward**: compatibility switch for the old behavior that rebuilt the meta model on every forward pass. Keep this `False` for speed unless a model family requires it.
 * **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
 
 ## MacOS

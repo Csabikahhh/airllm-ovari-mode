@@ -15,7 +15,12 @@ from transformers.quantizers import AutoHfQuantizer, HfQuantizer
 
 from .profiler import LayeredProfiler
 
-from optimum.bettertransformer import BetterTransformer
+try:
+    from optimum.bettertransformer import BetterTransformer
+except ImportError:
+    # optimum>=2.0 removed BetterTransformer (superseded by PyTorch native SDPA).
+    # Fall back to attn_implementation="sdpa" in init_model below.
+    BetterTransformer = None
 
 from .utils import clean_memory, load_layer, \
     find_or_create_local_splitted_path
@@ -56,7 +61,8 @@ class AirLLMBaseModel(GenerationMixin):
 
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=torch.float16, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
-                 hf_token=None, prefetching=True, delete_original=False):
+                 hf_token=None, prefetching=True, delete_original=False, cleanup_interval=4,
+                 reinitialize_model_each_forward=False, prefetch_workers=1):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -80,6 +86,12 @@ class AirLLMBaseModel(GenerationMixin):
             setting to '4bit' or '8bit' to enable compression from 16 bits to 4 bits/8 bits which speeed up 4x or 2x inference time with a tiny accuracy loss.
         hf_token: str, optional
             huggingface api token could be provided, by default None
+        cleanup_interval: int, optional
+            run full Python/CUDA allocator cleanup after this many streamed layers. 1 matches the historical behavior.
+        reinitialize_model_each_forward: bool, optional
+            rebuild the meta model on every forward. Kept as a compatibility escape hatch; disabled by default for speed.
+        prefetch_workers: int, optional
+            worker count for layer prefetching.
         """
 
 
@@ -91,6 +103,9 @@ class AirLLMBaseModel(GenerationMixin):
         self.total_compression_overhead_time = None
         self._supports_cache_class = False
         self.hf_quantizer = None
+        self.cleanup_interval = max(0, int(cleanup_interval or 0))
+        self.reinitialize_model_each_forward = bool(reinitialize_model_each_forward)
+        self.prefetch_workers = max(1, int(prefetch_workers or 1))
 
         if compression is not None:
             if not bitsandbytes_installed:
@@ -188,6 +203,9 @@ class AirLLMBaseModel(GenerationMixin):
             try:
                 with init_empty_weights():
                     self.model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=True)
+                    if BetterTransformer is None:
+                        # optimum>=2.0: BetterTransformer unavailable, fall back to sdpa path below
+                        raise ValueError("BetterTransformer not available")
                     self.model = BetterTransformer.transform(self.model)  # enable flash attention
             except ValueError as ve:
                 del self.model
@@ -287,11 +305,13 @@ class AirLLMBaseModel(GenerationMixin):
         if self.prefetching:
             t = time.time()
             if torch.cuda.is_available():  # Check if CUDA is available
-                for k in state_dict.keys():
-                    state_dict[k].pin_memory()
-            else:
-                # For CPU, no action is needed, but you could optionally add a log or message
-                print("Prefetching is enabled, but no pin_memory operation is needed for CPU.")
+                for k, value in list(state_dict.items()):
+                    if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                        try:
+                            state_dict[k] = value.pin_memory()
+                        except RuntimeError:
+                            # Some tensor/storage combinations cannot be pinned; keep the CPU tensor.
+                            pass
 
             elapsed_time = time.time() - t
             if self.profiling_mode:
@@ -368,8 +388,30 @@ class AirLLMBaseModel(GenerationMixin):
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
 
-    def get_past_key_values_cache_seq_len(self, past_key_values):
+    def get_past_key_values_cache_seq_len(self, past_key_values, layer_idx=0):
+        if cache_utils_installed and isinstance(past_key_values, Cache):
+            # transformers>=4.40 DynamicCache is not subscriptable like a tuple.
+            return past_key_values.get_seq_length(layer_idx)
         return past_key_values[0][0].shape[2]
+
+    def get_dynamic_cache(self):
+        try:
+            return DynamicCache(config=self.config)
+        except TypeError:
+            return DynamicCache()
+
+    def should_cleanup_after_layer(self, layer_index, total_layers):
+        if self.cleanup_interval <= 0:
+            return False
+        return (layer_index + 1) == total_layers or (layer_index + 1) % self.cleanup_interval == 0
+
+    def supports_dynamic_cache_forward(self):
+        return bool(
+            cache_utils_installed
+            and hasattr(self.model, "model")
+            and hasattr(self.model.model, "rotary_emb")
+        )
+
     def get_sequence_len(self, seq):
         return seq.shape[1]
 
@@ -393,6 +435,16 @@ class AirLLMBaseModel(GenerationMixin):
     def run_norm(self, layer, seq):
         return layer(seq)
 
+    def get_position_embeddings(self, hidden_states, position_ids):
+        # transformers>=4.40 computes RoPE (cos, sin) once at the model level and
+        # passes it into every decoder layer. AirLLM builds the model on the meta
+        # device, so the model's own rotary_emb has no materialized inv_freq buffer.
+        # Build a real rotary embedding once (on the running device) and reuse it.
+        if getattr(self, '_real_rotary_emb', None) is None:
+            rotary_cls = type(self.model.model.rotary_emb)
+            self._real_rotary_emb = rotary_cls(config=self.config).to(self.running_device)
+        return self._real_rotary_emb(hidden_states, position_ids)
+
     def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -405,11 +457,19 @@ class AirLLMBaseModel(GenerationMixin):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
+            **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
-        if cache_utils_installed:
-            # we don't support kv cache for new version yet
+        dynamic_cache_mode = bool(cache_utils_installed and use_cache and self.supports_dynamic_cache_forward())
+        if cache_utils_installed and use_cache and not dynamic_cache_mode:
             use_cache = False
+            past_key_values = None
+        if dynamic_cache_mode and input_ids is not None and input_ids.shape[0] != 1:
+            # DynamicCache is model-wide and updated in-place per layer. The legacy
+            # tuple path below is the safer option for batched requests.
+            dynamic_cache_mode = False
+            use_cache = False
+            past_key_values = None
 
         if self.profiling_mode:
             self.profiler.clear_profiling_time()
@@ -417,10 +477,13 @@ class AirLLMBaseModel(GenerationMixin):
             forward_start = time.process_time()
             forward_start_wall = time.time()
 
-        # Reboot the model to make sure buffers are loaded and memory is clean
-        del self.model
-        clean_memory()
-        self.init_model()
+        if self.reinitialize_model_each_forward:
+            # Compatibility mode for architectures that mutate module buffers while
+            # streaming layers. It is expensive, so the optimized default keeps the
+            # meta model alive across forward calls.
+            del self.model
+            clean_memory()
+            self.init_model()
 
         batch = [input_ids_unit.to(self.running_device).unsqueeze(0) for input_ids_unit in input_ids]
         n_seq = len(batch[0])
@@ -431,14 +494,19 @@ class AirLLMBaseModel(GenerationMixin):
         attention_mask = attention_mask.to(self.running_device)
         position_ids = torch.arange(self.max_seq_len, dtype=torch.long, device=self.running_device)[None, :]
 
-        kv_cache_list = [] if use_cache else None
-        if use_cache:
+        if dynamic_cache_mode:
+            kv_cache_list = past_key_values if isinstance(past_key_values, Cache) else self.get_dynamic_cache()
+            past_key_values = kv_cache_list
+        else:
+            kv_cache_list = [] if use_cache else None
+
+        if use_cache and not dynamic_cache_mode:
             for x in self.layers:
                 kv_cache_list.append(([], []))
-        all_hidden_states = [] * len(self.layers) if output_hidden_states else None
-        all_self_attns = [] * len(self.layers) if output_attentions else None
+        all_hidden_states = [] if output_hidden_states else None
+        all_self_attns = [[] for _ in self.layers] if output_attentions else None
 
-        with torch.inference_mode(), ThreadPoolExecutor() as executor:
+        with torch.inference_mode(), ThreadPoolExecutor(max_workers=self.prefetch_workers) as executor:
 
             # Load first layer
             if self.prefetching:
@@ -505,16 +573,36 @@ class AirLLMBaseModel(GenerationMixin):
                         #batch[j] = layer(seq[torch.arange(n_seq), batch_eos[j]][:, None])
                         batch[j] = self.run_norm(layer, seq)
 
-                        if output_attentions:
-                            all_hidden_states[i].append(batch[j])
                     elif layer_name == self.layer_names_dict['lm_head']:
                         batch[j] = self.run_lm_head(layer, seq)
                     else:
 
-                        if output_attentions:
-                            all_hidden_states[i].append(new_seq)
+                        if dynamic_cache_mode:
+                            layer_idx = i - 1
+                            len_p = self.get_past_key_values_cache_seq_len(past_key_values, layer_idx)
+                            len_s = self.get_sequence_len(seq)
 
-                        if past_key_values is not None:
+                            position_ids_args = self.get_position_ids_args(position_ids, len_p, len_s)
+                            attention_mask_args = self.get_attention_mask_args(attention_mask, len_p, len_s)
+                            pos_embed_args = self.get_pos_emb_args(len_p, len_s)
+
+                            kwargs = {
+                                'use_cache': True,
+                                'past_key_values': past_key_values,
+                                **pos_embed_args,
+                                **attention_mask_args,
+                                **position_ids_args,
+                            }
+                            kwargs['position_embeddings'] = self.get_position_embeddings(
+                                seq, position_ids_args.get('position_ids'))
+
+                            layer_outputs = layer(seq, **kwargs)
+                            new_seq = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
+
+                            if output_attentions and isinstance(layer_outputs, tuple) and len(layer_outputs) > 1:
+                                all_self_attns[i].append(layer_outputs[1])
+
+                        elif past_key_values is not None:
                             # join past kv
                             k_cache, v_cache = past_key_values[i - 1]
                             len_p = self.get_past_key_values_cache_seq_len(past_key_values)
@@ -565,8 +653,16 @@ class AirLLMBaseModel(GenerationMixin):
                                           }
                                 kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
 
-
-                                new_seq = layer(seq, **kwargs)[0]
+                                if cache_utils_installed:
+                                    # transformers>=4.40: the decoder layer needs the
+                                    # precomputed RoPE embeddings and returns the
+                                    # hidden states directly (not a tuple).
+                                    kwargs['position_embeddings'] = self.get_position_embeddings(
+                                        seq, position_ids_args.get('position_ids'))
+                                    layer_out = layer(seq, **kwargs)
+                                    new_seq = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+                                else:
+                                    new_seq = layer(seq, **kwargs)[0]
                             else:
 
                                 kwargs = {'use_cache': True,
@@ -595,17 +691,21 @@ class AirLLMBaseModel(GenerationMixin):
                         set_module_tensor_to_device(self.model, param_name,'meta')
                 else:
                     layer.to("meta")
-
-                layer.to("meta")
-                clean_memory()  # proposed by CPMP
+                del state_dict
+                if self.should_cleanup_after_layer(i, len(self.layer_names)):
+                    clean_memory(force_gc=False)  # keep allocator churn lower during streaming
 
         logits = torch.cat(batch, 0)
-        if use_cache:
+        returned_cache = None
+        if dynamic_cache_mode:
+            returned_cache = kv_cache_list
+        elif use_cache:
             kv_cache_list = kv_cache_list[1:-2]
             for i in range(len(kv_cache_list)):
                 # print(f"{i} - {kv_cache_list[i][0].shape}")
                 kv_cache_list[i] = (torch.cat(kv_cache_list[i][0], 0), torch.cat(kv_cache_list[i][1], 0))
             #print(f"returning kvcache size: {kv_cache_list[0][0].shape}")
+            returned_cache = tuple(kv_cache_list)
 
         if output_attentions:
             all_self_attns = all_self_attns[0:-2]
@@ -614,12 +714,10 @@ class AirLLMBaseModel(GenerationMixin):
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states[0:-2]
-            for i in range(len(all_hidden_states)):
-                all_hidden_states[i] = torch.cat(all_hidden_states[i], 0)
 
         if not return_dict:
             return tuple(v for v in [logits,
-                                     tuple(kv_cache_list) if kv_cache_list is not None else None,
+                                     returned_cache,
                                      tuple(all_hidden_states) if all_hidden_states is not None else None,
                                      tuple(all_self_attns) if all_self_attns is not None else None] if v is not None)
         if self.profiling_mode:
@@ -637,7 +735,7 @@ class AirLLMBaseModel(GenerationMixin):
         return CausalLMOutputWithPast(
             loss=None,
             logits=logits,
-            past_key_values=tuple(kv_cache_list) if kv_cache_list is not None else None,
+            past_key_values=returned_cache,
             hidden_states=tuple(all_hidden_states) if all_hidden_states is not None else None,
-            attentions=tuple(all_self_attns) if all_hidden_states is not None else None,
+            attentions=tuple(all_self_attns) if all_self_attns is not None else None,
         )

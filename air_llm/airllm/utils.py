@@ -72,14 +72,21 @@ class NotEnoughSpaceException(Exception):
     pass
 
 # Function to clean RAM & vRAM
-def clean_memory():
-    gc.collect()
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception as ex:
-        # maybe platform
-        pass
-    torch.cuda.empty_cache()
+def clean_memory(force_gc=True, trim_cpu=True, empty_cuda_cache=True):
+    if force_gc:
+        gc.collect()
+    if trim_cpu:
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            # malloc_trim is Linux/glibc-specific.
+            pass
+    if empty_cuda_cache:
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def uncompress_layer_state_dict(layer_state_dict):
@@ -142,7 +149,7 @@ def check_space(checkpoint_path, layer_shards_saving_path=None, compression=None
             total_saved_split_files_size_bytes += os.path.getsize(saved_split_file)
 
     if compression == '4bit':
-        total_shard_files_size_bytes = int(total_shard_files_size_bytes / 0.2813)
+        total_shard_files_size_bytes = int(total_shard_files_size_bytes * 0.2813)
     elif compression == '8bit':
         total_shard_files_size_bytes = total_shard_files_size_bytes // 2
 
@@ -176,6 +183,7 @@ def compress_layer_state_dict(layer_state_dict, compression=None):
     return compressed_layer_state_dict if compressed_layer_state_dict is not None else layer_state_dict
 
 def remove_real_and_linked_file(to_delete):
+    targetpath = None
     if (os.path.realpath(to_delete) != to_delete):
         targetpath = os.path.realpath(to_delete)
 
@@ -299,6 +307,31 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
         else:
             shards = [v for k, v in index.items() if k.startswith(layer)]
+            if len(shards) == 0:
+                # Layer absent from the weight index. This happens for `lm_head`
+                # when the model ties output weights to the input embeddings
+                # (e.g. Qwen2.5-3B and many small models). Recreate the lm_head
+                # weight from the embedding weight and persist it directly.
+                embed_index_keys = [k for k in index.keys() if 'embed_tokens' in k]
+                if layer == layers[-1] and len(embed_index_keys) > 0:
+                    if not ModelPersister.get_model_persister().model_persist_exist(layer, saving_path):
+                        embed_key = embed_index_keys[0]
+                        src_file = checkpoint_path / index[embed_key]
+                        if not os.path.exists(src_file):
+                            assert repo_id is not None
+                            huggingface_hub.snapshot_download(repo_id, allow_patterns=os.path.basename(src_file),
+                                                              token=hf_token)
+                        if not safetensors_format:
+                            src_state = torch.load(src_file, map_location='cpu')
+                        else:
+                            src_state = load_file(src_file, device='cpu')
+                        tied_state = {layer + 'weight': src_state[embed_key]}
+                        tied_state = compress_layer_state_dict(tied_state, compression)
+                        ModelPersister.get_model_persister().persist_model(tied_state, layer, saving_path)
+                    clean_memory()
+                    continue
+                raise ValueError(f"Layer '{layer}' was not found in the model weight index "
+                                 f"and could not be reconstructed.")
             single_modelfile = shards[0]
             to_load = checkpoint_path / single_modelfile
             # check if to_load exist, if not downloaad it...
