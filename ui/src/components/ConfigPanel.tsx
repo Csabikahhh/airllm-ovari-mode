@@ -30,6 +30,7 @@ import {
   ToggleField,
 } from "@/lib/ui-primitives"
 import { cn } from "@/lib/utils"
+import { configHints } from "@/lib/config-hints"
 import type {
   BenchmarkResult,
   HardwareProfile,
@@ -183,7 +184,7 @@ export function ConfigPanel({
           <CardDescription>Lokalis AirLLM vagy OpenAI-kompatibilis API</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4">
-          <Field label="Provider">
+          <Field label="Provider" hint={configHints.provider}>
             <SelectField
               value={providerForm.provider}
               onValueChange={(value) => updateProvider("provider", value as ProviderForm["provider"])}
@@ -195,7 +196,7 @@ export function ConfigPanel({
           </Field>
           {providerForm.provider === "openai_compatible" && (
             <>
-              <Field label="Preset">
+              <Field label="Preset" hint={configHints.providerPreset}>
                 <SelectField
                   value={providerForm.provider_preset}
                   onValueChange={(value) => {
@@ -212,7 +213,7 @@ export function ConfigPanel({
                   }))}
                 />
               </Field>
-              <Field label="Base URL">
+              <Field label="Base URL" hint={configHints.baseUrl}>
                 <Input
                   value={providerForm.external_base_url}
                   placeholder="https://api.example.com/v1"
@@ -220,14 +221,14 @@ export function ConfigPanel({
                 />
               </Field>
               <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_120px]">
-                <Field label="Model">
+                <Field label="Model" hint={configHints.externalModel}>
                   <Input
                     value={providerForm.external_model}
                     placeholder="provider-model-name"
                     onChange={(event) => updateProvider("external_model", event.target.value)}
                   />
                 </Field>
-                <Field label="Timeout">
+                <Field label="Timeout" hint={configHints.externalTimeout}>
                   <Input
                     type="number"
                     min={10}
@@ -237,7 +238,7 @@ export function ConfigPanel({
                   />
                 </Field>
               </div>
-              <Field label="API key">
+              <Field label="API key" hint={configHints.externalApiKey}>
                 <Input
                   type="password"
                   autoComplete="off"
@@ -257,7 +258,7 @@ export function ConfigPanel({
           <CardDescription>AirLLM AutoModel beallitasok</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4">
-          <Field label="Preset">
+          <Field label="Preset" hint={configHints.preset}>
             <SelectField
               value={presetIndex}
               onValueChange={(value) => {
@@ -275,7 +276,7 @@ export function ConfigPanel({
               ]}
             />
           </Field>
-          <Field label="Model ID / utvonal">
+          <Field label="Model ID / utvonal" hint={configHints.modelId}>
             <Input
               spellCheck={false}
               value={loadForm.model_id}
@@ -292,7 +293,7 @@ export function ConfigPanel({
                 : "grid gap-3 sm:grid-cols-2 2xl:grid-cols-3"
             }
           >
-            <Field label="Device">
+            <Field label="Device" hint={configHints.device}>
               <SelectField
                 value={loadForm.device}
                 onValueChange={(value) => updateLoad("device", value)}
@@ -303,7 +304,7 @@ export function ConfigPanel({
                 ]}
               />
             </Field>
-            <Field label="Dtype">
+            <Field label="Dtype" hint={configHints.dtype}>
               <SelectField
                 value={loadForm.dtype}
                 onValueChange={(value) => updateLoad("dtype", value)}
@@ -315,7 +316,7 @@ export function ConfigPanel({
                 ]}
               />
             </Field>
-            <Field label="Compression">
+            <Field label="Compression" hint={configHints.compression}>
               <SelectField
                 value={loadForm.compression}
                 onValueChange={(value) => updateLoad("compression", value)}
@@ -327,7 +328,7 @@ export function ConfigPanel({
                 ]}
               />
             </Field>
-            <Field label="Prefetching">
+            <Field label="Prefetching" hint={configHints.prefetching}>
               <SelectField
                 value={loadForm.prefetching}
                 onValueChange={(value) => updateLoad("prefetching", value)}
@@ -338,7 +339,7 @@ export function ConfigPanel({
                 ]}
               />
             </Field>
-            <Field label="Max seq len">
+            <Field label="Max seq len" hint={configHints.maxSeqLen}>
               <Input
                 type="number"
                 min={128}
@@ -354,14 +355,8 @@ export function ConfigPanel({
             <summary className="cursor-pointer px-3 py-3 text-sm font-medium text-foreground/90 select-none hover:bg-muted/40">
               Halado beallitasok
             </summary>
-            <div
-              className={
-                isSidebar
-                  ? "grid gap-3 border-t px-3 pt-3 pb-3 grid-cols-1"
-                  : "grid gap-3 border-t px-3 pt-3 pb-3 sm:grid-cols-2 2xl:grid-cols-3"
-              }
-            >
-              <Field label="Cleanup interval">
+            <div className="grid grid-cols-1 gap-3 border-t px-3 pt-3 pb-2">
+              <Field label="Cleanup interval" hint={configHints.cleanupInterval}>
                 <Input
                   type="number"
                   min={0}
@@ -370,7 +365,7 @@ export function ConfigPanel({
                   onChange={(event) => updateLoad("cleanup_interval", event.target.value)}
                 />
               </Field>
-              <Field label="Prefetch workers">
+              <Field label="Prefetch workers" hint={configHints.prefetchWorkers}>
                 <Input
                   type="number"
                   min={1}
@@ -379,13 +374,13 @@ export function ConfigPanel({
                   onChange={(event) => updateLoad("prefetch_workers", event.target.value)}
                 />
               </Field>
-              <Field label="Layer cache" className="sm:col-span-2 2xl:col-span-1">
+              <Field label="Layer cache" hint={configHints.layerCache}>
                 <Input
                   value={loadForm.layer_shards_saving_path}
                   onChange={(event) => updateLoad("layer_shards_saving_path", event.target.value)}
                 />
               </Field>
-              <Field label="HF token" className="sm:col-span-2 2xl:col-span-3">
+              <Field label="HF token" hint={configHints.hfToken}>
                 <Input
                   type="password"
                   autoComplete="off"
@@ -393,18 +388,23 @@ export function ConfigPanel({
                   onChange={(event) => updateLoad("hf_token", event.target.value)}
                 />
               </Field>
+            </div>
+            <div className="grid grid-cols-1 gap-2 border-t px-3 pt-2 pb-3">
               <ToggleField
                 label="Profiling"
+                hint={configHints.profiling}
                 checked={loadForm.profiling_mode}
                 onCheckedChange={(checked) => updateLoad("profiling_mode", checked)}
               />
               <ToggleField
                 label="Delete original"
+                hint={configHints.deleteOriginal}
                 checked={loadForm.delete_original}
                 onCheckedChange={(checked) => updateLoad("delete_original", checked)}
               />
               <ToggleField
                 label="Reinit / forward"
+                hint={configHints.reinitForward}
                 checked={loadForm.reinitialize_model_each_forward}
                 onCheckedChange={(checked) => updateLoad("reinitialize_model_each_forward", checked)}
               />

@@ -31,6 +31,7 @@ import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { Field, pretty, ToggleField } from "@/lib/ui-primitives"
+import { configHints } from "@/lib/config-hints"
 import { cn } from "@/lib/utils"
 import type {
   AgentResponse,
@@ -608,7 +609,7 @@ function App() {
                 <CardDescription>Egy gombbal indithato lokalis kodos asszisztens</CardDescription>
               </CardHeader>
               <CardContent className="grid gap-4">
-                <Field label="Feladat">
+                <Field label="Feladat" hint={configHints.agentObjective}>
                   <Textarea
                     className="min-h-28 resize-y"
                     value={agentObjective}
@@ -616,14 +617,14 @@ function App() {
                   />
                 </Field>
                 <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_180px]">
-                  <Field label="Workspace utvonal">
+                  <Field label="Workspace utvonal" hint={configHints.agentWorkspace}>
                     <Input
                       value={agentWorkspace}
                       placeholder="uresen hagyva: projekt root"
                       onChange={(event) => setAgentWorkspace(event.target.value)}
                     />
                   </Field>
-                  <Field label="Context karakter">
+                  <Field label="Context karakter" hint={configHints.agentContextChars}>
                     <Input
                       type="number"
                       min={4000}
@@ -749,7 +750,7 @@ function GenerationControls({
   return (
     <>
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-        <Field label="Input max">
+        <Field label="Input max" hint={configHints.inputMax}>
           <Input
             type="number"
             min={16}
@@ -759,7 +760,7 @@ function GenerationControls({
             onChange={(event) => updateGenerate("max_length", event.target.value)}
           />
         </Field>
-        <Field label="New tokens">
+        <Field label="New tokens" hint={configHints.newTokens}>
           <Input
             type="number"
             min={1}
@@ -768,7 +769,7 @@ function GenerationControls({
             onChange={(event) => updateGenerate("max_new_tokens", event.target.value)}
           />
         </Field>
-        <Field label="Temperature">
+        <Field label="Temperature" hint={configHints.temperature}>
           <Input
             type="number"
             min={0}
@@ -778,7 +779,7 @@ function GenerationControls({
             onChange={(event) => updateGenerate("temperature", event.target.value)}
           />
         </Field>
-        <Field label="Top p">
+        <Field label="Top p" hint={configHints.topP}>
           <Input
             type="number"
             min={0.05}
@@ -788,7 +789,7 @@ function GenerationControls({
             onChange={(event) => updateGenerate("top_p", event.target.value)}
           />
         </Field>
-        <Field label="Top k">
+        <Field label="Top k" hint={configHints.topK}>
           <Input
             type="number"
             min={0}
@@ -797,7 +798,7 @@ function GenerationControls({
             onChange={(event) => updateGenerate("top_k", event.target.value)}
           />
         </Field>
-        <Field label="Repeat penalty">
+        <Field label="Repeat penalty" hint={configHints.repeatPenalty}>
           <Input
             type="number"
             min={0.8}
@@ -811,16 +812,19 @@ function GenerationControls({
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         <ToggleField
           label="Autoload"
+          hint={configHints.autoload}
           checked={generateForm.autoload}
           onCheckedChange={(checked) => updateGenerate("autoload", checked)}
         />
         <ToggleField
           label="KV cache"
+          hint={configHints.kvCache}
           checked={generateForm.use_cache}
           onCheckedChange={(checked) => updateGenerate("use_cache", checked)}
         />
         <ToggleField
           label="Chat template"
+          hint={configHints.chatTemplate}
           checked={generateForm.use_chat_template}
           onCheckedChange={(checked) => updateGenerate("use_chat_template", checked)}
         />

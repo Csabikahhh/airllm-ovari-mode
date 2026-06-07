@@ -1,4 +1,5 @@
 import type { ReactNode } from "react"
+import { CircleHelp } from "lucide-react"
 import { Label } from "@/components/ui/label"
 import {
   Select,
@@ -8,7 +9,36 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
+
+export function HelpHint({ text }: { text: string }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          className="inline-flex size-5 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          aria-label="Sugo"
+        >
+          <CircleHelp className="size-3.5" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top" align="start">
+        {text}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function FieldLabel({ label, hint }: { label: string; hint?: string }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <Label className="text-sm font-medium text-foreground/90">{label}</Label>
+      {hint ? <HelpHint text={hint} /> : null}
+    </div>
+  )
+}
 
 export function pretty(value: string | number | null | undefined, fallback = "-") {
   if (value === null || value === undefined || value === "") return fallback
@@ -17,16 +47,18 @@ export function pretty(value: string | number | null | undefined, fallback = "-"
 
 export function Field({
   label,
+  hint,
   children,
   className,
 }: {
   label: string
+  hint?: string
   children: ReactNode
   className?: string
 }) {
   return (
-    <div className={cn("grid gap-1.5", className)}>
-      <Label className="text-sm font-medium text-foreground/90">{label}</Label>
+    <div className={cn("grid min-w-0 gap-1.5", className)}>
+      <FieldLabel label={label} hint={hint} />
       {children}
     </div>
   )
@@ -111,16 +143,21 @@ export function SelectField({
 
 export function ToggleField({
   label,
+  hint,
   checked,
   onCheckedChange,
 }: {
   label: string
+  hint?: string
   checked: boolean
   onCheckedChange: (checked: boolean) => void
 }) {
   return (
-    <div className="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2">
-      <Label className="leading-normal">{label}</Label>
+    <div className="flex min-w-0 items-center justify-between gap-3 rounded-md border bg-background px-3 py-2.5">
+      <div className="flex min-w-0 items-center gap-1.5">
+        <Label className="leading-normal">{label}</Label>
+        {hint ? <HelpHint text={hint} /> : null}
+      </div>
       <Switch checked={checked} onCheckedChange={onCheckedChange} />
     </div>
   )
