@@ -1,23 +1,15 @@
 import { useEffect, useMemo, useState } from "react"
 import {
-  Activity,
   Bot,
-  Cloud,
   Code2,
-  Cpu,
-  Gauge,
-  HardDrive,
   LoaderCircle,
   MessageSquare,
   Play,
-  Power,
-  RefreshCw,
   Send,
-  Server,
-  Sparkles,
-  Square,
+  Settings,
   Trash2,
 } from "lucide-react"
+import { ConfigPanel } from "@/components/ConfigPanel"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -28,180 +20,30 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet"
 import { Separator } from "@/components/ui/separator"
-import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
+import { Field, pretty, ToggleField } from "@/lib/ui-primitives"
 import { cn } from "@/lib/utils"
-
-type Preset = {
-  label: string
-  model_id: string
-  family: string
-  size: string
-}
-
-type ProviderPreset = {
-  label: string
-  base_url: string
-  model: string
-  needs_key: boolean
-}
-
-type HardwareProfile = {
-  platform: string
-  python: string
-  cpu: {
-    name: string
-    logical_cores: number
-  }
-  memory: {
-    total_gb: number | null
-    available_gb: number | null
-  }
-  disk: {
-    hf_home: string
-    total_gb: number | null
-    free_gb: number | null
-  }
-  power: {
-    active_scheme: string | null
-    raw: string | null
-  }
-  network: {
-    interface: string | null
-    radio: string | null
-    receive_mbps: number | string | null
-    transmit_mbps: number | string | null
-    signal: string | null
-  }
-  cuda: {
-    available: boolean
-    error: string | null
-    devices: Array<{
-      index: number
-      name: string
-      total_memory_gb: number | null
-      compute_capability: string
-    }>
-  }
-  torch: {
-    available: boolean
-    version: string | null
-    error: string | null
-  }
-  bitsandbytes: {
-    available: boolean
-  }
-  supported_families: string[]
-  recommendation: {
-    device: string
-    dtype: string
-    compression: string
-    prefetching: boolean
-    cleanup_interval: number
-    prefetch_workers: number
-    reinitialize_model_each_forward: boolean
-    max_seq_len: number
-    max_new_tokens: number
-  }
-}
-
-type Status = {
-  loaded: boolean
-  config: null | {
-    provider?: string
-    base_url?: string
-    model_id: string
-    device?: string
-    dtype?: string
-    compression?: string | null
-    max_seq_len?: number
-    prefetching?: boolean
-    cleanup_interval?: number
-    prefetch_workers?: number
-    reinitialize_model_each_forward?: boolean
-    hf_token_set?: boolean
-    api_key_set?: boolean
-  }
-  loaded_at: number | null
-  load_seconds: number | null
-}
-
-type LoadForm = {
-  model_id: string
-  device: string
-  dtype: string
-  compression: string
-  prefetching: string
-  cleanup_interval: string
-  prefetch_workers: string
-  reinitialize_model_each_forward: boolean
-  max_seq_len: string
-  layer_shards_saving_path: string
-  hf_token: string
-  profiling_mode: boolean
-  delete_original: boolean
-}
-
-type GenerateForm = {
-  prompt: string
-  max_length: string
-  max_new_tokens: string
-  temperature: string
-  top_p: string
-  top_k: string
-  repetition_penalty: string
-  autoload: boolean
-  use_cache: boolean
-  use_chat_template: boolean
-}
-
-type ProviderForm = {
-  provider: "local" | "openai_compatible"
-  provider_preset: string
-  external_base_url: string
-  external_model: string
-  external_api_key: string
-  external_timeout: string
-}
-
-type ChatMessage = {
-  role: "user" | "assistant"
-  content: string
-}
-
-type AgentResponse = {
-  text: string
-  seconds: number
-  input_tokens: number
-  output_tokens: number
-  workspace: string
-  included_files: string[]
-  context_files: string[]
-  status: Status
-}
-
-type BenchmarkResult = {
-  gpu_matmul_ms: number | null
-  cpu_matmul_ms: number | null
-  disk_write_mbps: number | null
-  disk_read_mbps: number | null
-  model_probe: null | {
-    seconds?: number
-    input_tokens?: number
-    output_tokens?: number
-    error?: string
-  }
-}
+import type {
+  AgentResponse,
+  BenchmarkResult,
+  ChatMessage,
+  GenerateForm,
+  HardwareProfile,
+  LoadForm,
+  Preset,
+  ProviderForm,
+  ProviderPreset,
+  Status,
+} from "@/types/app"
 
 const defaultLoadForm: LoadForm = {
   model_id: "Qwen/Qwen2.5-3B-Instruct",
@@ -254,121 +96,46 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return payload as T
 }
 
-function pretty(value: string | number | null | undefined, fallback = "-") {
-  if (value === null || value === undefined || value === "") return fallback
-  return value
-}
-
-function Field({
-  label,
-  children,
-  className,
-}: {
-  label: string
-  children: React.ReactNode
-  className?: string
-}) {
-  return (
-    <div className={cn("grid gap-2", className)}>
-      <Label>{label}</Label>
-      {children}
-    </div>
-  )
-}
-
-function Metric({
-  icon,
-  label,
-  value,
-  tone = "default",
-}: {
-  icon: React.ReactNode
-  label: string
-  value: React.ReactNode
-  tone?: "default" | "good" | "warn"
-}) {
-  return (
-    <div
-      className={cn(
-        "flex min-h-20 gap-3 rounded-lg border bg-muted/35 p-3",
-        tone === "good" && "border-emerald-200 bg-emerald-50",
-        tone === "warn" && "border-amber-200 bg-amber-50",
-      )}
-    >
-      <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-md bg-background text-muted-foreground">
-        {icon}
-      </div>
-      <div className="min-w-0">
-        <p className="text-xs font-medium text-muted-foreground">{label}</p>
-        <div className="mt-1 break-words text-sm font-semibold leading-snug">{value}</div>
-      </div>
-    </div>
-  )
-}
-
-function Log({ entries }: { entries: string[] }) {
-  return (
-    <div className="max-h-44 min-h-28 overflow-auto rounded-md border bg-muted/45 p-3 font-mono text-xs leading-relaxed text-muted-foreground">
-      {entries.length ? entries.join("\n") : "Nincs naplo."}
-    </div>
-  )
-}
-
-function SelectField({
-  value,
-  onValueChange,
-  options,
-}: {
-  value: string
-  onValueChange: (value: string) => void
-  options: Array<{ value: string; label: string }>
-}) {
-  return (
-    <Select value={value} onValueChange={onValueChange}>
-      <SelectTrigger>
-        <SelectValue />
-      </SelectTrigger>
-      <SelectContent>
-        {options.map((option) => (
-          <SelectItem key={option.value} value={option.value}>
-            {option.label}
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
-  )
-}
-
-function ToggleField({
-  label,
-  checked,
-  onCheckedChange,
-}: {
-  label: string
-  checked: boolean
-  onCheckedChange: (checked: boolean) => void
-}) {
-  return (
-    <div className="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2">
-      <Label className="leading-normal">{label}</Label>
-      <Switch checked={checked} onCheckedChange={onCheckedChange} />
-    </div>
-  )
-}
-
 function MessageBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user"
   return (
-    <div className={cn("flex", isUser ? "justify-end" : "justify-start")}>
+    <div className={cn("flex gap-2.5", isUser ? "flex-row-reverse" : "flex-row")}>
       <div
         className={cn(
-          "max-w-[94%] whitespace-pre-wrap break-words rounded-lg border px-3 py-2 text-sm leading-relaxed sm:max-w-[88%]",
-          isUser
-            ? "border-primary bg-primary text-primary-foreground"
-            : "bg-muted/60 text-foreground",
+          "flex size-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold",
+          isUser ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground",
         )}
       >
-        {message.content}
+        {isUser ? "Te" : "AI"}
+      </div>
+      <div className={cn("flex min-w-0 max-w-[85%] flex-col gap-1", isUser ? "items-end" : "items-start")}>
+        <span className="text-xs font-medium text-muted-foreground">{isUser ? "Te" : "Asszisztens"}</span>
+        <div
+          className={cn(
+            "whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed shadow-sm sm:text-[15px]",
+            isUser
+              ? "rounded-tr-md bg-primary text-primary-foreground"
+              : "rounded-tl-md border bg-card text-foreground",
+          )}
+        >
+          {message.content}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ChatEmptyState() {
+  return (
+    <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 py-12 text-center">
+      <div className="flex size-14 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+        <MessageSquare className="size-7" />
+      </div>
+      <div className="space-y-1">
+        <p className="text-base font-medium text-foreground">Kezdj el beszelgetni</p>
+        <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
+          Ird be az elso uzenetet lent, es a betoltott lokalis modell valaszol.
+        </p>
       </div>
     </div>
   )
@@ -393,6 +160,8 @@ function App() {
   const [benchmark, setBenchmark] = useState<BenchmarkResult | null>(null)
   const [logs, setLogs] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [initializing, setInitializing] = useState(true)
 
   const gpuLabel = useMemo(() => {
     if (!hardware?.cuda.available || !hardware.cuda.devices.length) return "nincs CUDA"
@@ -667,16 +436,54 @@ function App() {
         await refreshStatus()
       } catch (error) {
         addLog(error instanceof Error ? error.message : "Inditasi hiba")
+      } finally {
+        setInitializing(false)
       }
     })()
   }, [])
 
+  const statusLabel = initializing
+    ? "Betoltes..."
+    : providerForm.provider === "local"
+      ? status?.loaded
+        ? "Betoltve"
+        : "Ures"
+      : "Kulso provider"
+
+  const modelLabel =
+    providerForm.provider === "local"
+      ? status?.loaded
+        ? status.config?.model_id ?? "Nincs betoltott modell"
+        : "Nincs betoltott modell"
+      : providerForm.external_model || "Nincs kulso model megadva"
+
+  const configPanelProps = {
+    hardware,
+    gpuLabel,
+    benchmark,
+    busy,
+    logs,
+    providerForm,
+    providerPresets,
+    updateProvider,
+    presetIndex,
+    setPresetIndex,
+    presets,
+    loadForm,
+    updateLoad,
+    onBenchmark: () => void handleBenchmark(),
+    onLoad: () => void handleLoad(),
+    onUnload: () => void handleUnload(),
+    onOptimize: () => void handleOptimize(),
+    onCancel: () => void handleCancel(),
+  }
+
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      <header className="sticky top-0 z-10 border-b bg-background/95 backdrop-blur">
+    <div className="flex min-h-screen flex-col bg-[linear-gradient(180deg,oklch(0.97_0.006_247)_0%,var(--background)_12rem)] text-foreground">
+      <header className="sticky top-0 z-20 shrink-0 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
         <div className="mx-auto flex w-full max-w-[1500px] flex-col gap-3 px-3 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-4">
           <div className="flex min-w-0 items-center gap-3">
-            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground sm:size-10">
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-sm sm:size-10">
               <Bot className="size-5" />
             </div>
             <div className="min-w-0">
@@ -685,414 +492,116 @@ function App() {
             </div>
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <Badge variant={status?.loaded ? "default" : "secondary"}>
-              {providerForm.provider === "local" ? (status?.loaded ? "Betoltve" : "Ures") : "Kulso provider"}
+            <Button
+              variant="outline"
+              size="sm"
+              className="xl:hidden"
+              onClick={() => setSettingsOpen(true)}
+            >
+              <Settings className="size-4" />
+              Beallitasok
+            </Button>
+            <Badge variant={initializing ? "secondary" : status?.loaded ? "default" : "secondary"}>
+              {statusLabel}
             </Badge>
-            <span className="min-w-0 max-w-full truncate text-sm text-muted-foreground sm:max-w-[520px]">
-              {providerForm.provider === "local"
-                ? status?.loaded
-                  ? status.config?.model_id
-                  : "Nincs betoltott modell"
-                : providerForm.external_model || "Nincs kulso model megadva"}
+            <span
+              className="hidden rounded-full border bg-muted/50 px-3 py-1 text-xs text-muted-foreground sm:inline-block sm:max-w-[520px] sm:truncate"
+              title={modelLabel}
+            >
+              {modelLabel}
             </span>
           </div>
         </div>
       </header>
 
-      <main className="mx-auto grid w-full max-w-[1500px] grid-cols-1 gap-3 p-3 sm:gap-4 sm:p-4 xl:grid-cols-[430px_minmax(0,1fr)]">
-        <div className="grid min-w-0 gap-3 sm:gap-4">
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Gauge className="size-4" />
-                Hardver
-              </CardTitle>
-              <CardDescription>Automatikus runtime profil</CardDescription>
-            </CardHeader>
-            <CardContent className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
-              <Metric icon={<Cpu className="size-4" />} label="CPU" value={`${hardware?.cpu.logical_cores ?? "-"} szal`} />
-              <Metric
-                icon={<Server className="size-4" />}
-                label="RAM"
-                value={`${pretty(hardware?.memory.available_gb, "?")} / ${pretty(hardware?.memory.total_gb, "?")} GB`}
-              />
-              <Metric
-                icon={<Sparkles className="size-4" />}
-                label="GPU"
-                value={gpuLabel}
-                tone={hardware?.cuda.available ? "good" : "warn"}
-              />
-              <Metric
-                icon={<HardDrive className="size-4" />}
-                label="HF cache"
-                value={`${pretty(hardware?.disk.free_gb, "?")} GB szabad`}
-              />
-              <Metric
-                icon={<Power className="size-4" />}
-                label="Torch"
-                value={hardware?.torch.version ?? "nem elerheto"}
-                tone={hardware?.torch.available ? "good" : "warn"}
-              />
-              <Metric
-                icon={<RefreshCw className="size-4" />}
-                label="bitsandbytes"
-                value={hardware?.bitsandbytes.available ? "elerheto" : "nem elerheto"}
-                tone={hardware?.bitsandbytes.available ? "good" : "warn"}
-              />
-              <Metric
-                icon={<Power className="size-4" />}
-                label="Energia"
-                value={hardware?.power.active_scheme ?? "ismeretlen"}
-                tone={
-                  hardware?.power.active_scheme?.toLowerCase().includes("balanced") ||
-                  hardware?.power.active_scheme?.toLowerCase().includes("kiegy")
-                    ? "warn"
-                    : "default"
-                }
-              />
-              <Metric
-                icon={<Activity className="size-4" />}
-                label="Halozat"
-                value={
-                  hardware?.network.radio
-                    ? `${hardware.network.radio}, ${pretty(hardware.network.receive_mbps, "?")} Mbps`
-                    : "ismeretlen"
-                }
-              />
-              <div className="grid gap-2 sm:col-span-2 xl:col-span-1 2xl:col-span-2">
-                <Button className="w-full" variant="outline" onClick={handleBenchmark} disabled={busy}>
-                  {busy ? <LoaderCircle className="animate-spin" /> : <Activity />}
-                  Benchmark
-                </Button>
-                {benchmark && (
-                  <div className="grid gap-2 rounded-lg border bg-muted/35 p-3 text-xs text-muted-foreground sm:grid-cols-2">
-                    <span>GPU matmul: {pretty(benchmark.gpu_matmul_ms, "?")} ms</span>
-                    <span>CPU matmul: {pretty(benchmark.cpu_matmul_ms, "?")} ms</span>
-                    <span>SSD iras: {pretty(benchmark.disk_write_mbps, "?")} MB/s</span>
-                    <span>SSD olvasas: {pretty(benchmark.disk_read_mbps, "?")} MB/s</span>
-                  </div>
-                )}
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Cloud className="size-4" />
-                AI szolgaltato
-              </CardTitle>
-              <CardDescription>Lokalis AirLLM vagy OpenAI-kompatibilis API</CardDescription>
-            </CardHeader>
-            <CardContent className="grid gap-4">
-              <Field label="Provider">
-                <SelectField
-                  value={providerForm.provider}
-                  onValueChange={(value) => updateProvider("provider", value as ProviderForm["provider"])}
-                  options={[
-                    { value: "local", label: "Local AirLLM" },
-                    { value: "openai_compatible", label: "OpenAI-compatible" },
-                  ]}
-                />
-              </Field>
-              {providerForm.provider === "openai_compatible" && (
-                <>
-                  <Field label="Preset">
-                    <SelectField
-                      value={providerForm.provider_preset}
-                      onValueChange={(value) => {
-                        updateProvider("provider_preset", value)
-                        const preset = providerPresets[Number(value)]
-                        if (preset) {
-                          updateProvider("external_base_url", preset.base_url)
-                          updateProvider("external_model", preset.model)
-                        }
-                      }}
-                      options={providerPresets.map((preset, index) => ({
-                        value: String(index),
-                        label: preset.label,
-                      }))}
-                    />
-                  </Field>
-                  <Field label="Base URL">
-                    <Input
-                      value={providerForm.external_base_url}
-                      placeholder="https://api.example.com/v1"
-                      onChange={(event) => updateProvider("external_base_url", event.target.value)}
-                    />
-                  </Field>
-                  <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_120px]">
-                    <Field label="Model">
-                      <Input
-                        value={providerForm.external_model}
-                        placeholder="provider-model-name"
-                        onChange={(event) => updateProvider("external_model", event.target.value)}
-                      />
-                    </Field>
-                    <Field label="Timeout">
-                      <Input
-                        type="number"
-                        min={10}
-                        max={600}
-                        value={providerForm.external_timeout}
-                        onChange={(event) => updateProvider("external_timeout", event.target.value)}
-                      />
-                    </Field>
-                  </div>
-                  <Field label="API key">
-                    <Input
-                      type="password"
-                      autoComplete="off"
-                      value={providerForm.external_api_key}
-                      placeholder="csak a kereshez hasznalva"
-                      onChange={(event) => updateProvider("external_api_key", event.target.value)}
-                    />
-                  </Field>
-                </>
-              )}
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Modell</CardTitle>
-              <CardDescription>AirLLM AutoModel beallitasok</CardDescription>
-            </CardHeader>
-            <CardContent className="grid gap-4">
-              <Field label="Preset">
-                <SelectField
-                  value={presetIndex}
-                  onValueChange={(value) => {
-                    setPresetIndex(value)
-                    if (value !== "custom") {
-                      updateLoad("model_id", presets[Number(value)]?.model_id ?? loadForm.model_id)
-                    }
-                  }}
-                  options={[
-                    ...presets.map((preset, index) => ({
-                      value: String(index),
-                      label: `${preset.label} (${preset.family})`,
-                    })),
-                    { value: "custom", label: "Egyedi model ID" },
-                  ]}
-                />
-              </Field>
-              <Field label="Model ID / utvonal">
-                <Input
-                  spellCheck={false}
-                  value={loadForm.model_id}
-                  onChange={(event) => {
-                    setPresetIndex("custom")
-                    updateLoad("model_id", event.target.value)
-                  }}
-                />
-              </Field>
-              <div className="grid gap-3 sm:grid-cols-2 2xl:grid-cols-3">
-                <Field label="Device">
-                  <SelectField
-                    value={loadForm.device}
-                    onValueChange={(value) => updateLoad("device", value)}
-                    options={[
-                      { value: "auto", label: "auto" },
-                      { value: "cuda:0", label: "cuda:0" },
-                      { value: "cpu", label: "cpu" },
-                    ]}
-                  />
-                </Field>
-                <Field label="Dtype">
-                  <SelectField
-                    value={loadForm.dtype}
-                    onValueChange={(value) => updateLoad("dtype", value)}
-                    options={[
-                      { value: "auto", label: "auto" },
-                      { value: "float16", label: "float16" },
-                      { value: "bfloat16", label: "bfloat16" },
-                      { value: "float32", label: "float32" },
-                    ]}
-                  />
-                </Field>
-                <Field label="Compression">
-                  <SelectField
-                    value={loadForm.compression}
-                    onValueChange={(value) => updateLoad("compression", value)}
-                    options={[
-                      { value: "auto", label: "auto" },
-                      { value: "none", label: "none" },
-                      { value: "4bit", label: "4bit" },
-                      { value: "8bit", label: "8bit" },
-                    ]}
-                  />
-                </Field>
-                <Field label="Prefetching">
-                  <SelectField
-                    value={loadForm.prefetching}
-                    onValueChange={(value) => updateLoad("prefetching", value)}
-                    options={[
-                      { value: "auto", label: "auto" },
-                      { value: "true", label: "on" },
-                      { value: "false", label: "off" },
-                    ]}
-                  />
-                </Field>
-                <Field label="Max seq len">
-                  <Input
-                    type="number"
-                    min={128}
-                    max={32768}
-                    step={128}
-                    value={loadForm.max_seq_len}
-                    onChange={(event) => updateLoad("max_seq_len", event.target.value)}
-                  />
-                </Field>
-                <Field label="Cleanup interval">
-                  <Input
-                    type="number"
-                    min={0}
-                    max={64}
-                    value={loadForm.cleanup_interval}
-                    onChange={(event) => updateLoad("cleanup_interval", event.target.value)}
-                  />
-                </Field>
-                <Field label="Prefetch workers">
-                  <Input
-                    type="number"
-                    min={1}
-                    max={4}
-                    value={loadForm.prefetch_workers}
-                    onChange={(event) => updateLoad("prefetch_workers", event.target.value)}
-                  />
-                </Field>
-                <Field label="Layer cache">
-                  <Input
-                    value={loadForm.layer_shards_saving_path}
-                    onChange={(event) => updateLoad("layer_shards_saving_path", event.target.value)}
-                  />
-                </Field>
-              </div>
-              <Field label="HF token">
-                <Input
-                  type="password"
-                  autoComplete="off"
-                  value={loadForm.hf_token}
-                  onChange={(event) => updateLoad("hf_token", event.target.value)}
-                />
-              </Field>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <ToggleField
-                  label="Profiling"
-                  checked={loadForm.profiling_mode}
-                  onCheckedChange={(checked) => updateLoad("profiling_mode", checked)}
-                />
-                <ToggleField
-                  label="Delete original"
-                  checked={loadForm.delete_original}
-                  onCheckedChange={(checked) => updateLoad("delete_original", checked)}
-                />
-                <ToggleField
-                  label="Reinit / forward"
-                  checked={loadForm.reinitialize_model_each_forward}
-                  onCheckedChange={(checked) => updateLoad("reinitialize_model_each_forward", checked)}
-                />
-              </div>
-              <div className="grid gap-2 sm:grid-cols-4">
-                <Button className="w-full" onClick={handleLoad} disabled={busy || providerForm.provider !== "local"}>
-                  {busy ? <LoaderCircle className="animate-spin" /> : <Power />}
-                  Betolt
-                </Button>
-                <Button className="w-full" variant="destructive" onClick={handleUnload} disabled={busy || providerForm.provider !== "local"}>
-                  <Trash2 />
-                  Kiurit
-                </Button>
-                <Button className="w-full" variant="outline" onClick={handleOptimize} disabled={busy}>
-                  <Gauge />
-                  Optimalizal
-                </Button>
-                <Button className="w-full" variant="outline" onClick={handleCancel} disabled={!busy || providerForm.provider !== "local"}>
-                  <Square />
-                  Stop
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Naplo</CardTitle>
-              <CardDescription>Backend es modellmuveletek</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <Log entries={logs} />
-            </CardContent>
-          </Card>
+      <main className="mx-auto grid w-full max-w-[1500px] flex-1 grid-cols-1 gap-4 p-3 sm:p-4 xl:grid-cols-[400px_minmax(0,1fr)] xl:items-start">
+        <div className="hidden min-w-0 xl:block xl:sticky xl:top-[57px] xl:max-h-[calc(100vh-3.75rem)] xl:overflow-y-auto xl:pr-1">
+          <ConfigPanel {...configPanelProps} layout="sidebar" />
         </div>
 
-        <Tabs defaultValue="chat" className="min-w-0">
-          <TabsList className="mb-1 grid h-auto w-full grid-cols-1 gap-1 bg-transparent p-0 sm:mb-2 sm:grid-cols-3 sm:bg-muted sm:p-1">
-            <TabsTrigger className="w-full justify-start sm:justify-center" value="chat">
-              <MessageSquare className="size-4" />
+        <Tabs defaultValue="chat" className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <TabsList className="sticky top-[57px] z-10 mb-3 grid h-auto w-full shrink-0 grid-cols-3 gap-1 rounded-xl border bg-background/95 p-1 shadow-sm backdrop-blur supports-[backdrop-filter]:bg-background/80 xl:static xl:top-auto xl:w-full xl:bg-muted">
+            <TabsTrigger className="h-10 w-full justify-center gap-2 rounded-lg px-3" value="chat">
+              <MessageSquare className="size-4 shrink-0" />
               Chat
             </TabsTrigger>
-            <TabsTrigger className="w-full justify-start sm:justify-center" value="agent">
-              <Code2 className="size-4" />
-              Coding Agent
+            <TabsTrigger className="h-10 w-full justify-center gap-2 rounded-lg px-3" value="agent">
+              <Code2 className="size-4 shrink-0" />
+              Agent
             </TabsTrigger>
-            <TabsTrigger className="w-full justify-start sm:justify-center" value="generate">
-              <Play className="size-4" />
+            <TabsTrigger className="h-10 w-full justify-center gap-2 rounded-lg px-3" value="generate">
+              <Play className="size-4 shrink-0" />
               Generate
             </TabsTrigger>
           </TabsList>
 
-          <TabsContent value="chat" className="grid gap-4">
-            <Card>
-              <CardHeader>
-                <CardTitle>ChatUI</CardTitle>
-                <CardDescription>A betoltott lokalis modell valaszol a beszelgetesben</CardDescription>
+          <TabsContent value="chat" className="mt-0 flex min-h-0 flex-1 flex-col data-[state=inactive]:hidden">
+            <Card className="flex min-h-[calc(100dvh-11rem)] flex-1 flex-col overflow-hidden shadow-sm xl:min-h-[calc(100vh-9.5rem)]">
+              <CardHeader className="shrink-0 border-b bg-muted/20 py-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <CardTitle>ChatUI</CardTitle>
+                    <CardDescription className="mt-1">
+                      A betoltott lokalis modell valaszol a beszelgetesben
+                    </CardDescription>
+                  </div>
+                  {status?.loaded && (
+                    <Badge variant="outline" className="shrink-0">
+                      {providerForm.provider === "local"
+                        ? `${status.config?.device} / ${status.config?.dtype}`
+                        : providerForm.external_model}
+                    </Badge>
+                  )}
+                </div>
               </CardHeader>
-              <CardContent className="grid gap-4">
-                <div className="flex min-h-[320px] flex-col gap-3 overflow-auto rounded-lg border bg-muted/20 p-3 sm:min-h-[430px]">
+              <CardContent className="flex min-h-0 flex-1 flex-col p-0">
+                <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto bg-muted/10 p-4">
                   {chatMessages.length ? (
                     chatMessages.map((message, index) => <MessageBubble key={index} message={message} />)
                   ) : (
-                    <div className="flex h-full min-h-[260px] items-center justify-center rounded-md border border-dashed p-4 text-center text-sm text-muted-foreground sm:min-h-[380px]">
-                      Ird be az elso uzenetet, majd kuldd el a lokalis modellnek.
-                    </div>
+                    <ChatEmptyState />
                   )}
                 </div>
-                <div className="grid gap-3">
-                  <Textarea
-                    className="min-h-24 resize-y"
-                    value={chatInput}
-                    onChange={(event) => setChatInput(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
-                        event.preventDefault()
-                        void handleChatSend()
-                      }
-                    }}
-                  />
-                  <div className="grid gap-2 sm:flex sm:flex-wrap sm:items-center">
-                    <Button className="w-full sm:w-auto" onClick={handleChatSend} disabled={busy || !chatInput.trim()}>
-                      {busy ? <LoaderCircle className="animate-spin" /> : <Send />}
-                      Kuldes
-                    </Button>
-                    <Button className="w-full sm:w-auto" variant="outline" onClick={() => setChatMessages([])} disabled={busy}>
-                      <Trash2 />
-                      Chat torles
-                    </Button>
-                    {status?.loaded && (
-                      <Badge variant="outline">
-                        {providerForm.provider === "local"
-                          ? `${status.config?.device} / ${status.config?.dtype}`
-                          : providerForm.external_model}
-                      </Badge>
-                    )}
+                <div className="shrink-0 border-t bg-background/95 p-4 pb-[max(1rem,env(safe-area-inset-bottom))] backdrop-blur">
+                  <div className="grid gap-3">
+                    <Textarea
+                      className="min-h-[88px] resize-none bg-background text-[15px] leading-relaxed"
+                      placeholder="Uzenet... (Ctrl+Enter a kuldeshez)"
+                      value={chatInput}
+                      onChange={(event) => setChatInput(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                          event.preventDefault()
+                          void handleChatSend()
+                        }
+                      }}
+                    />
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                      <Button
+                        className="w-full sm:w-auto"
+                        onClick={() => void handleChatSend()}
+                        disabled={busy || !chatInput.trim()}
+                      >
+                        {busy ? <LoaderCircle className="animate-spin" /> : <Send />}
+                        Kuldes
+                      </Button>
+                      <Button
+                        className="w-full sm:w-auto"
+                        variant="outline"
+                        onClick={() => setChatMessages([])}
+                        disabled={busy}
+                      >
+                        <Trash2 />
+                        Chat torles
+                      </Button>
+                    </div>
                   </div>
                 </div>
               </CardContent>
             </Card>
           </TabsContent>
 
-          <TabsContent value="agent" className="grid gap-4">
+          <TabsContent value="agent" className="mt-0 grid gap-4">
             <Card>
               <CardHeader>
                 <CardTitle>Coding Agent</CardTitle>
@@ -1145,7 +654,7 @@ function App() {
                 </CardDescription>
               </CardHeader>
               <CardContent className="grid gap-4">
-                <div className="min-h-[320px] whitespace-pre-wrap break-words rounded-lg border bg-slate-950 p-3 text-sm leading-relaxed text-slate-50 sm:min-h-96 sm:p-4 sm:text-[15px]">
+                <div className="max-h-[60vh] min-h-[40vh] whitespace-pre-wrap break-words rounded-lg border bg-slate-950 p-3 text-sm leading-relaxed text-slate-50 sm:min-h-96 sm:max-h-none sm:p-4 sm:text-[15px]">
                   {agentOutput?.text ?? ""}
                 </div>
                 {agentOutput && (
@@ -1167,7 +676,7 @@ function App() {
             </Card>
           </TabsContent>
 
-          <TabsContent value="generate" className="grid gap-4">
+          <TabsContent value="generate" className="mt-0 grid gap-4">
             <Card>
               <CardHeader>
                 <CardTitle>Prompt</CardTitle>
@@ -1206,7 +715,7 @@ function App() {
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <div className="min-h-[260px] whitespace-pre-wrap break-words rounded-lg border bg-slate-950 p-3 text-sm leading-relaxed text-slate-50 sm:min-h-80 sm:p-4 sm:text-[15px]">
+                <div className="max-h-[60vh] min-h-[40vh] whitespace-pre-wrap break-words rounded-lg border bg-slate-950 p-3 text-sm leading-relaxed text-slate-50 sm:min-h-80 sm:max-h-none sm:p-4 sm:text-[15px]">
                   {output}
                 </div>
               </CardContent>
@@ -1214,6 +723,18 @@ function App() {
           </TabsContent>
         </Tabs>
       </main>
+
+      <Sheet open={settingsOpen} onOpenChange={setSettingsOpen}>
+        <SheetContent side="right" className="w-full overflow-y-auto sm:max-w-lg">
+          <SheetHeader>
+            <SheetTitle>Beallitasok</SheetTitle>
+            <SheetDescription>Hardver, provider, modell es naplo</SheetDescription>
+          </SheetHeader>
+          <div className="overflow-y-auto pb-[max(1rem,env(safe-area-inset-bottom))]">
+            <ConfigPanel {...configPanelProps} layout="stack" />
+          </div>
+        </SheetContent>
+      </Sheet>
     </div>
   )
 }
@@ -1227,7 +748,7 @@ function GenerationControls({
 }) {
   return (
     <>
-      <div className="grid gap-3 md:grid-cols-3">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         <Field label="Input max">
           <Input
             type="number"
@@ -1287,7 +808,7 @@ function GenerationControls({
           />
         </Field>
       </div>
-      <div className="grid gap-3 md:grid-cols-3">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         <ToggleField
           label="Autoload"
           checked={generateForm.autoload}
