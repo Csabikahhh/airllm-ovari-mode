@@ -73,6 +73,7 @@ export type HardwareProfile = {
 
 export type Status = {
   loaded: boolean
+  mode?: string | null
   config: null | {
     provider?: string
     base_url?: string
@@ -110,6 +111,7 @@ export type LoadForm = {
 
 export type GenerateForm = {
   prompt: string
+  task_mode: string
   max_length: string
   max_new_tokens: string
   temperature: string

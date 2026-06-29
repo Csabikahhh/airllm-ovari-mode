@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import {
   Bot,
   Code2,
@@ -30,7 +30,7 @@ import {
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
-import { Field, pretty, ToggleField } from "@/lib/ui-primitives"
+import { Field, pretty, SelectField, ToggleField } from "@/lib/ui-primitives"
 import { configHints } from "@/lib/config-hints"
 import { cn } from "@/lib/utils"
 import type {
@@ -64,6 +64,7 @@ const defaultLoadForm: LoadForm = {
 
 const defaultGenerateForm: GenerateForm = {
   prompt: "Szia! Foglald ossze roviden, mire jo az AirLLM.",
+  task_mode: "chat",
   max_length: "512",
   max_new_tokens: "96",
   temperature: "0.7",
@@ -73,6 +74,14 @@ const defaultGenerateForm: GenerateForm = {
   autoload: true,
   use_cache: true,
   use_chat_template: true,
+}
+
+// Sampling presets mirror the server-side TASK_PRESETS (airllm_ui.py). Selecting a task
+// mode repopulates the sampling fields so the user sees and can still tweak the values.
+const TASK_PRESETS: Record<string, { temperature: string; top_p: string; top_k: string; repetition_penalty: string }> = {
+  chat: { temperature: "0.7", top_p: "0.9", top_k: "50", repetition_penalty: "1.05" },
+  factual: { temperature: "0.2", top_p: "0.9", top_k: "40", repetition_penalty: "1.1" },
+  code: { temperature: "0", top_p: "0.95", top_k: "0", repetition_penalty: "1.0" },
 }
 
 const defaultProviderForm: ProviderForm = {
@@ -95,6 +104,114 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(message)
   }
   return payload as T
+}
+
+type StreamSummary = {
+  seconds?: number
+  cancelled?: boolean
+  output_chars?: number
+  output_tokens?: number
+  tokens_per_second?: number
+}
+
+// Coalesce high-frequency token updates into at most one React state write per animation
+// frame (~60/s). Without this, fast / prompt-lookup-bursty streams trigger one re-render per
+// token (hundreds per response). apply() always receives the latest accumulated text.
+function rafBatcher(apply: (text: string) => void) {
+  let acc = ""
+  let scheduled = false
+  let done = false
+  const flush = () => {
+    scheduled = false
+    if (!done) apply(acc)
+  }
+  return {
+    push(token: string) {
+      acc += token
+      if (!scheduled && !done) {
+        scheduled = true
+        requestAnimationFrame(flush)
+      }
+    },
+    finish() {
+      done = true
+      apply(acc)
+      return acc
+    },
+  }
+}
+
+// POST a request and consume the Server-Sent Events token stream. Calls onToken for each
+// incremental token and returns the final summary event (or null). An optional AbortSignal
+// tears the stream down on cancel/unmount.
+async function streamPost(
+  path: string,
+  body: unknown,
+  onToken: (token: string) => void,
+  signal?: AbortSignal,
+): Promise<StreamSummary | null> {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  })
+  if (!response.ok || !response.body) {
+    let message = "API hiba"
+    try {
+      const payload = await response.json()
+      if (typeof payload?.error === "string") message = payload.error
+    } catch {
+      // non-JSON error body; keep the generic message
+    }
+    throw new Error(message)
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  let summary: StreamSummary | null = null
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let sep = buffer.indexOf("\n\n")
+      while (sep !== -1) {
+        const frame = buffer.slice(0, sep)
+        buffer = buffer.slice(sep + 2)
+        sep = buffer.indexOf("\n\n")
+        const data = frame.startsWith("data: ") ? frame.slice(6) : frame
+        if (!data || data === "[DONE]") continue
+        let event: Record<string, unknown>
+        try {
+          event = JSON.parse(data) as Record<string, unknown>
+        } catch {
+          continue
+        }
+        if (typeof event.token === "string") {
+          onToken(event.token)
+        } else if (typeof event.error === "string") {
+          throw new Error(event.error)
+        } else if (event.done) {
+          summary = {
+            seconds: typeof event.seconds === "number" ? event.seconds : undefined,
+            cancelled: typeof event.cancelled === "boolean" ? event.cancelled : undefined,
+            output_chars: typeof event.output_chars === "number" ? event.output_chars : undefined,
+            output_tokens: typeof event.output_tokens === "number" ? event.output_tokens : undefined,
+            tokens_per_second: typeof event.tokens_per_second === "number" ? event.tokens_per_second : undefined,
+          }
+        }
+      }
+    }
+  } catch (error) {
+    // A client-side abort (cancel / unmount) is expected; surface what we have instead of
+    // throwing so the UI shows the partial answer rather than an error.
+    if (signal?.aborted) return summary ?? { cancelled: true }
+    throw error
+  }
+  return summary
 }
 
 function MessageBubble({ message }: { message: ChatMessage }) {
@@ -163,6 +280,7 @@ function App() {
   const [busy, setBusy] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [initializing, setInitializing] = useState(true)
+  const streamAbortRef = useRef<AbortController | null>(null)
 
   const gpuLabel = useMemo(() => {
     if (!hardware?.cuda.available || !hardware.cuda.devices.length) return "nincs CUDA"
@@ -182,6 +300,11 @@ function App() {
 
   function updateGenerate<K extends keyof GenerateForm>(key: K, value: GenerateForm[K]) {
     setGenerateForm((current) => ({ ...current, [key]: value }))
+  }
+
+  function applyTaskMode(mode: string) {
+    const preset = TASK_PRESETS[mode] ?? TASK_PRESETS.chat
+    setGenerateForm((current) => ({ ...current, task_mode: mode, ...preset }))
   }
 
   function updateProvider<K extends keyof ProviderForm>(key: K, value: ProviderForm[K]) {
@@ -280,6 +403,7 @@ function App() {
 
   async function handleCancel() {
     try {
+      // Cooperative server-side stop first (lets the worker thread halt cleanly)...
       await api<{ cancel_requested: boolean }>("/api/cancel", {
         method: "POST",
         body: "{}",
@@ -287,6 +411,9 @@ function App() {
       addLog("megszakitas kerese elkuldve")
     } catch (error) {
       addLog(error instanceof Error ? error.message : "Megszakitasi hiba")
+    } finally {
+      // ...then tear down the client stream so the UI reacts instantly.
+      streamAbortRef.current?.abort()
     }
   }
 
@@ -326,25 +453,45 @@ function App() {
 
   async function handleGenerate() {
     setBusy(true)
-    setOutput("Dolgozom...")
+    setOutput("")
     addLog("generalas indul")
     try {
-      const result = await api<{
-        text: string
-        seconds: number
-        input_tokens: number
-        output_tokens: number
-        status: Status
-      }>("/api/generate", {
-        method: "POST",
-        body: JSON.stringify({
-          ...requestPayload(),
-          ...generateForm,
-        }),
-      })
-      setOutput(result.text)
-      setStatus(result.status)
-      addLog(`kesz: ${result.seconds}s, input=${result.input_tokens}, output=${result.output_tokens}`)
+      if (providerForm.provider === "local") {
+        // Local models stream token-by-token over SSE so output appears as it is produced.
+        const controller = new AbortController()
+        streamAbortRef.current = controller
+        const batch = rafBatcher(setOutput)
+        let summary: StreamSummary | null = null
+        try {
+          summary = await streamPost(
+            "/api/generate",
+            { ...requestPayload(), ...generateForm, stream: true },
+            (token) => batch.push(token),
+            controller.signal,
+          )
+        } finally {
+          streamAbortRef.current = null
+        }
+        const acc = batch.finish()
+        if (!acc) setOutput("(ures valasz)")
+        await refreshStatus()
+        const tps = summary?.tokens_per_second ? `, ${summary.tokens_per_second} tok/s` : ""
+        addLog(`kesz: ${summary?.seconds ?? "?"}s, tokens=${summary?.output_tokens ?? "?"}${tps}`)
+      } else {
+        const result = await api<{
+          text: string
+          seconds: number
+          input_tokens: number
+          output_tokens: number
+          status: Status
+        }>("/api/generate", {
+          method: "POST",
+          body: JSON.stringify({ ...requestPayload(), ...generateForm }),
+        })
+        setOutput(result.text)
+        setStatus(result.status)
+        addLog(`kesz: ${result.seconds}s, input=${result.input_tokens}, output=${result.output_tokens}`)
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Generalasi hiba"
       setOutput(message)
@@ -364,26 +511,59 @@ function App() {
     setBusy(true)
     addLog("chat uzenet kuldese")
     try {
-      const result = await api<{
-        message: ChatMessage
-        seconds: number
-        input_tokens: number
-        output_tokens: number
-        status: Status
-      }>("/api/chat", {
-        method: "POST",
-        body: JSON.stringify({
-          ...requestPayload(),
-          ...generateForm,
-          messages: nextMessages,
-        }),
-      })
-      setChatMessages((current) => [...current, result.message])
-      setStatus(result.status)
-      addLog(`chat kesz: ${result.seconds}s, input=${result.input_tokens}, output=${result.output_tokens}`)
+      if (providerForm.provider === "local") {
+        // Stream the reply into a live assistant bubble token by token.
+        setChatMessages((current) => [...current, { role: "assistant", content: "" }])
+        const controller = new AbortController()
+        streamAbortRef.current = controller
+        const applyToBubble = (text: string) =>
+          setChatMessages((current) => {
+            const copy = current.slice()
+            copy[copy.length - 1] = { role: "assistant", content: text }
+            return copy
+          })
+        const batch = rafBatcher(applyToBubble)
+        let summary: StreamSummary | null = null
+        try {
+          summary = await streamPost(
+            "/api/chat",
+            { ...requestPayload(), ...generateForm, messages: nextMessages, stream: true },
+            (token) => batch.push(token),
+            controller.signal,
+          )
+        } finally {
+          streamAbortRef.current = null
+        }
+        batch.finish()
+        await refreshStatus()
+        const tps = summary?.tokens_per_second ? `, ${summary.tokens_per_second} tok/s` : ""
+        addLog(`chat kesz: ${summary?.seconds ?? "?"}s${tps}`)
+      } else {
+        const result = await api<{
+          message: ChatMessage
+          seconds: number
+          input_tokens: number
+          output_tokens: number
+          status: Status
+        }>("/api/chat", {
+          method: "POST",
+          body: JSON.stringify({ ...requestPayload(), ...generateForm, messages: nextMessages }),
+        })
+        setChatMessages((current) => [...current, result.message])
+        setStatus(result.status)
+        addLog(`chat kesz: ${result.seconds}s, input=${result.input_tokens}, output=${result.output_tokens}`)
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Chat hiba"
-      setChatMessages((current) => [...current, { role: "assistant", content: message }])
+      setChatMessages((current) => {
+        const copy = current.slice()
+        if (copy.length && copy[copy.length - 1].role === "assistant") {
+          copy[copy.length - 1] = { role: "assistant", content: message }
+        } else {
+          copy.push({ role: "assistant", content: message })
+        }
+        return copy
+      })
       addLog(message)
     } finally {
       setBusy(false)
@@ -430,17 +610,26 @@ function App() {
 
   useEffect(() => {
     void (async () => {
-      try {
-        await refreshPresets()
-        await refreshProviders()
-        await refreshHardware()
-        await refreshStatus()
-      } catch (error) {
-        addLog(error instanceof Error ? error.message : "Inditasi hiba")
-      } finally {
-        setInitializing(false)
+      // These four boot calls are independent -> run them concurrently (was sequential, so
+      // boot latency was the SUM of all four incl. the ~134ms hardware probe). allSettled so
+      // one failure does not block the others.
+      const results = await Promise.allSettled([
+        refreshPresets(),
+        refreshProviders(),
+        refreshHardware(),
+        refreshStatus(),
+      ])
+      for (const result of results) {
+        if (result.status === "rejected") {
+          addLog(result.reason instanceof Error ? result.reason.message : "Inditasi hiba")
+        }
       }
+      setInitializing(false)
     })()
+    return () => {
+      // Abort any in-flight stream if the component unmounts.
+      streamAbortRef.current?.abort()
+    }
   }, [])
 
   const statusLabel = initializing
@@ -549,7 +738,7 @@ function App() {
                   {status?.loaded && (
                     <Badge variant="outline" className="shrink-0">
                       {providerForm.provider === "local"
-                        ? `${status.config?.device} / ${status.config?.dtype}`
+                        ? `${status.config?.device} / ${status.config?.dtype}${status.mode ? ` · ${status.mode}` : ""}`
                         : providerForm.external_model}
                     </Badge>
                   )}
@@ -689,7 +878,7 @@ function App() {
                   value={generateForm.prompt}
                   onChange={(event) => updateGenerate("prompt", event.target.value)}
                 />
-                <GenerationControls generateForm={generateForm} updateGenerate={updateGenerate} />
+                <GenerationControls generateForm={generateForm} updateGenerate={updateGenerate} onTaskMode={applyTaskMode} />
                 <div className="grid gap-2 sm:flex sm:flex-wrap sm:items-center">
                   <Button className="w-full sm:w-auto" size="lg" onClick={handleGenerate} disabled={busy}>
                     {busy ? <LoaderCircle className="animate-spin" /> : <Play />}
@@ -698,7 +887,7 @@ function App() {
                   {status?.loaded && (
                     <Badge variant="outline">
                       {providerForm.provider === "local"
-                        ? `${status.config?.device} / ${status.config?.dtype}`
+                        ? `${status.config?.device} / ${status.config?.dtype}${status.mode ? ` · ${status.mode}` : ""}`
                         : providerForm.external_model}
                     </Badge>
                   )}
@@ -743,12 +932,28 @@ function App() {
 function GenerationControls({
   generateForm,
   updateGenerate,
+  onTaskMode,
 }: {
   generateForm: GenerateForm
   updateGenerate: <K extends keyof GenerateForm>(key: K, value: GenerateForm[K]) => void
+  onTaskMode: (mode: string) => void
 }) {
   return (
     <>
+      <Field
+        label="Feladat mod"
+        hint="Chat: kreativ alapertekek. Tenyszeru: alacsony homerseklet, enyhe ismetles-buntetes. Kod: greedy dekodolas, nincs ismetles-buntetes."
+      >
+        <SelectField
+          value={generateForm.task_mode}
+          onValueChange={onTaskMode}
+          options={[
+            { value: "chat", label: "Chat / kreativ" },
+            { value: "factual", label: "Tenyszeru" },
+            { value: "code", label: "Kod" },
+          ]}
+        />
+      </Field>
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         <Field label="Input max" hint={configHints.inputMax}>
           <Input

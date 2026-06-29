@@ -185,6 +185,7 @@ MODEL_LOCK = threading.RLock()
 MODEL_STATE: Dict[str, Any] = {
     "model": None,
     "config": None,
+    "mode": None,
     "loaded_at": None,
     "load_seconds": None,
 }
@@ -410,7 +411,20 @@ def hardware_profile() -> Dict[str, Any]:
     }
 
 
+_REC_SETTINGS_CACHE: Optional[Dict[str, Any]] = None
+
+
 def recommended_settings() -> Dict[str, Any]:
+    # Hardware (CUDA availability, VRAM, bf16 support) is static within a run, but this is
+    # called on every load/generate path (and used to CUDA-probe each time). Compute once,
+    # then hand back a copy so callers can mutate freely without poisoning the cache.
+    global _REC_SETTINGS_CACHE
+    if _REC_SETTINGS_CACHE is None:
+        _REC_SETTINGS_CACHE = _compute_recommended_settings()
+    return dict(_REC_SETTINGS_CACHE)
+
+
+def _compute_recommended_settings() -> Dict[str, Any]:
     torch, _ = get_torch()
     cuda_available = bool(torch is not None and torch.cuda.is_available())
     bnb_available = import_bitsandbytes_ok()
@@ -447,9 +461,17 @@ def recommended_settings() -> Dict[str, Any]:
         max_new_tokens = 256
 
     compression = "4bit" if bnb_available else "none"
+    # Prefer bf16 on capable GPUs (Ampere+/Blackwell): same memory + speed as fp16 but a
+    # wider exponent range, which avoids overflow->NaN on bf16-trained models (Qwen, Llama).
+    rec_dtype = "float16"
+    try:
+        if torch is not None and torch.cuda.is_bf16_supported():
+            rec_dtype = "bfloat16"
+    except Exception:
+        rec_dtype = "float16"
     return {
         "device": "cuda:0",
-        "dtype": "float16",
+        "dtype": rec_dtype,
         "compression": compression,
         "prefetching": compression == "none",
         "cleanup_interval": 4,
@@ -636,7 +658,13 @@ def resolve_dtype(value: str, device: str) -> Any:
 
     requested = (value or "auto").strip()
     if requested == "auto":
-        requested = "float16" if device.startswith("cuda") else "float32"
+        if device.startswith("cuda") and torch.cuda.is_available():
+            try:
+                requested = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+            except Exception:
+                requested = "float16"
+        else:
+            requested = "float32"
 
     dtype_map = {
         "float16": torch.float16,
@@ -674,13 +702,16 @@ def safe_public_config(config: Optional[Dict[str, Any]]) -> Optional[Dict[str, A
 
 
 def current_status() -> Dict[str, Any]:
-    with MODEL_LOCK:
-        return {
-            "loaded": MODEL_STATE["model"] is not None,
-            "config": safe_public_config(MODEL_STATE["config"]),
-            "loaded_at": MODEL_STATE["loaded_at"],
-            "load_seconds": MODEL_STATE["load_seconds"],
-        }
+    # Lock-free read: MODEL_STATE entries are plain references swapped atomically
+    # under MODEL_LOCK in load_model/unload_model, so a status read never needs the
+    # lock. This keeps /api/status responsive while a (slow) generation holds the lock.
+    return {
+        "loaded": MODEL_STATE["model"] is not None,
+        "config": safe_public_config(MODEL_STATE["config"]),
+        "mode": MODEL_STATE.get("mode"),
+        "loaded_at": MODEL_STATE["loaded_at"],
+        "load_seconds": MODEL_STATE["load_seconds"],
+    }
 
 
 def selected_provider(payload: Dict[str, Any]) -> str:
@@ -714,6 +745,7 @@ def unload_model() -> Dict[str, Any]:
     with MODEL_LOCK:
         MODEL_STATE["model"] = None
         MODEL_STATE["config"] = None
+        MODEL_STATE["mode"] = None
         MODEL_STATE["loaded_at"] = None
         MODEL_STATE["load_seconds"] = None
 
@@ -765,11 +797,16 @@ def normalized_load_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     layer_path = (payload.get("layer_shards_saving_path") or "").strip() or None
     hf_token = (payload.get("hf_token") or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip() or None
 
+    load_mode = str(payload.get("load_mode") or "auto").strip().lower()
+    if load_mode not in {"auto", "airllm", "direct"}:
+        load_mode = "auto"
+
     return {
         "model_id": model_id,
         "device": device,
         "dtype": dtype_name,
         "compression": compression,
+        "load_mode": load_mode,
         "max_seq_len": max_seq_len,
         "prefetching": prefetching,
         "cleanup_interval": cleanup_interval,
@@ -780,6 +817,190 @@ def normalized_load_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         "layer_shards_saving_path": layer_path,
         "hf_token": hf_token,
     }
+
+
+def estimate_model_weight_gb(config: Any, bytes_per_param: int = 2) -> Optional[float]:
+    """Estimate resident weight size in GB from a HF config.
+
+    Counts attention (q/k/v/o, GQA-aware), gated MLP (3 matrices, MoE-aware),
+    embeddings and lm_head (untied unless tie_word_embeddings). Used only to decide
+    whether a model can be loaded resident instead of disk-streamed by AirLLM, so a
+    conservative over-estimate (e.g. MoE) is the safe direction.
+    """
+    try:
+        hidden = int(getattr(config, "hidden_size"))
+        layers = int(getattr(config, "num_hidden_layers"))
+        vocab = int(getattr(config, "vocab_size"))
+    except Exception:
+        return None
+    if hidden <= 0 or layers <= 0 or vocab <= 0:
+        return None
+    inter = int(getattr(config, "intermediate_size", 0) or (4 * hidden))
+    n_heads = int(getattr(config, "num_attention_heads", 0) or 0)
+    n_kv = int(getattr(config, "num_key_value_heads", n_heads) or n_heads)
+    if n_heads > 0:
+        head_dim = int(getattr(config, "head_dim", 0) or (hidden // n_heads))
+        kv_dim = head_dim * n_kv if n_kv > 0 else hidden
+    else:
+        kv_dim = hidden
+    n_experts = int(getattr(config, "num_local_experts", 0) or getattr(config, "num_experts", 0) or 1)
+    q_o = 2 * hidden * hidden
+    k_v = 2 * hidden * kv_dim
+    mlp = 3 * hidden * inter * max(1, n_experts)
+    per_layer = q_o + k_v + mlp + 2 * hidden
+    tied = bool(getattr(config, "tie_word_embeddings", False))
+    embed = vocab * hidden * (1 if tied else 2)
+    total_params = layers * per_layer + embed + hidden
+    return total_params * bytes_per_param / (1024 ** 3)
+
+
+def free_vram_gb(device: str) -> Optional[float]:
+    torch, _ = get_torch()
+    if torch is None:
+        return None
+    try:
+        return torch.cuda.mem_get_info(device)[0] / (1024 ** 3)
+    except Exception:
+        try:
+            return torch.cuda.mem_get_info()[0] / (1024 ** 3)
+        except Exception:
+            return None
+
+
+def _quant_bits(quant_cfg: Any) -> Optional[int]:
+    """Best-effort bit-width from a HF quantization_config (dict or object: GPTQ/AWQ/...)."""
+    for get in (
+        lambda: getattr(quant_cfg, "bits", None),
+        lambda: quant_cfg.get("bits") if isinstance(quant_cfg, dict) else None,
+        lambda: getattr(quant_cfg, "w_bit", None),
+        lambda: quant_cfg.get("w_bit") if isinstance(quant_cfg, dict) else None,
+    ):
+        try:
+            value = get()
+            if value:
+                return int(value)
+        except Exception:
+            pass
+    return None
+
+
+def plan_load_strategy(config: Dict[str, Any], dtype: Any) -> Tuple[str, Dict[str, Any]]:
+    """Decide between AirLLM disk-streaming and a resident direct load.
+
+    Returns (strategy, info) where strategy is one of:
+      - "airllm":         existing layer-by-layer disk streaming (default/fallback)
+      - "direct_gpu":     plain transformers model fully resident on the GPU
+      - "direct_offload": plain transformers model with accelerate CPU/disk offload
+    """
+    torch, _ = get_torch()
+    requested = config.get("load_mode", "auto")
+    device = config.get("device", "cpu")
+    info: Dict[str, Any] = {"requested": requested}
+
+    if requested == "airllm":
+        info["reason"] = "explicit airllm"
+        return "airllm", info
+    # Direct load only makes sense on CUDA, without AirLLM-only compression.
+    if torch is None or not str(device).startswith("cuda") or config.get("compression") is not None:
+        info["reason"] = "no cuda / compression set"
+        return "airllm", info
+
+    bytes_pp = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+    from transformers import AutoConfig
+
+    try:
+        hf_config = AutoConfig.from_pretrained(
+            config["model_id"], trust_remote_code=True,
+            **({"token": config["hf_token"]} if config.get("hf_token") else {}),
+        )
+    except Exception as exc:
+        info["reason"] = f"config read failed: {exc}"
+        # If the user explicitly forced direct, still try a GPU load; else stay on AirLLM.
+        return ("direct_gpu", info) if requested == "direct" else ("airllm", info)
+
+    quant_cfg = getattr(hf_config, "quantization_config", None)
+    if quant_cfg is not None:
+        # Prequantized (GPTQ/AWQ/...) checkpoints can load resident via transformers IF a
+        # matching kernel lib is installed (gptqmodel/autoawq) -- far faster than AirLLM
+        # disk-streaming. Only attempt it on explicit load_mode="direct" (auto stays on the
+        # safe AirLLM path); build_direct_model()'s exception is caught by load_model() and
+        # falls back to AirLLM if the kernel is missing or it OOMs.
+        if requested != "direct":
+            info["reason"] = "prequantized checkpoint -> airllm (set load_mode=direct to try resident)"
+            return "airllm", info
+        bits = _quant_bits(quant_cfg)
+        est_q = estimate_model_weight_gb(hf_config, bytes_per_param=2)
+        if est_q is not None and bits:
+            est_q = est_q * (bits / 16.0)  # weights shrink ~bits/16 vs bf16 (rough; embeds excluded)
+        vram_q = free_vram_gb(device)
+        info.update({"quant_bits": bits, "est_gb": round(est_q, 2) if est_q else None,
+                     "free_vram_gb": round(vram_q, 2) if vram_q else None})
+        if est_q is not None and vram_q is not None and est_q <= max(0.0, vram_q - 1.0):
+            info["reason"] = f"prequantized {bits}bit fits VRAM -> direct_gpu"
+            return "direct_gpu", info
+        info["reason"] = "prequantized too large for VRAM -> airllm"
+        return "airllm", info
+
+    est_gb = estimate_model_weight_gb(hf_config, bytes_pp)
+    vram = free_vram_gb(device)
+    ram = get_memory_info().get("available_gb")
+    info.update({"est_gb": round(est_gb, 2) if est_gb else None,
+                 "free_vram_gb": round(vram, 2) if vram else None,
+                 "free_ram_gb": ram})
+
+    # GPU budget: reserve ~1 GB of CURRENTLY-FREE VRAM for the CUDA context, KV cache and
+    # activation peak. If the estimate is slightly off and the load OOMs, load_model() has
+    # a guarded fallback to AirLLM streaming, so a modest reserve is safe.
+    if est_gb is not None and vram is not None and est_gb <= max(0.0, vram - 1.0):
+        info["reason"] = "fits VRAM"
+        return "direct_gpu", info
+    # CPU/disk offload is far faster than AirLLM disk streaming, but only auto-pick it
+    # when the user explicitly asked for "direct" (it can still be slow / thrash).
+    if requested == "direct" and est_gb is not None and ram is not None and est_gb <= max(0.0, ram - 2.0):
+        info["reason"] = "offload to RAM"
+        return "direct_offload", info
+    info["reason"] = "too large -> airllm streaming"
+    return "airllm", info
+
+
+def build_direct_model(config: Dict[str, Any], dtype: Any, strategy: str) -> Any:
+    """Load a plain transformers model resident (GPU or accelerate offload) and make it
+    look enough like an AirLLM model for the serving layer (model.tokenizer / .max_seq_len /
+    .generate)."""
+    torch, _ = get_torch()
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    token = config.get("hf_token")
+    common: Dict[str, Any] = {"dtype": dtype, "trust_remote_code": True}
+    if token:
+        common["token"] = token
+
+    if strategy == "direct_offload":
+        vram = free_vram_gb(config["device"]) or 6.0
+        ram = get_memory_info().get("available_gb") or 8.0
+        gpu_cap = max(1, int(vram * 0.8))
+        cpu_cap = max(1, int(ram * 0.6))
+        common["device_map"] = "auto"
+        common["max_memory"] = {0: f"{gpu_cap}GiB", "cpu": f"{cpu_cap}GiB"}
+        common["offload_folder"] = os.path.join(tempfile.gettempdir(), "airllm_offload")
+        common["low_cpu_mem_usage"] = True
+    else:  # direct_gpu
+        common["device_map"] = {"": config["device"]}
+
+    # Prefer the SDPA attention kernel; retry without it for models that reject the kwarg.
+    try:
+        model = AutoModelForCausalLM.from_pretrained(config["model_id"], attn_implementation="sdpa", **common)
+    except (ValueError, TypeError):
+        model = AutoModelForCausalLM.from_pretrained(config["model_id"], **common)
+
+    model.eval()
+    tok_kwargs = {"trust_remote_code": True}
+    if token:
+        tok_kwargs["token"] = token
+    model.tokenizer = AutoTokenizer.from_pretrained(config["model_id"], **tok_kwargs)
+    model.max_seq_len = config["max_seq_len"]
+    model._airllm_direct = True
+    return model
 
 
 def load_model(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -808,36 +1029,60 @@ def load_model(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         dtype = resolve_dtype(config["dtype"], config["device"])
 
-        from airllm import AutoModel
+        # Decide whether the model can run resident (fast) or must be disk-streamed by
+        # AirLLM. Resident inference is ~1-2 orders of magnitude faster for models that fit.
+        strategy, plan_info = plan_load_strategy(config, dtype)
+        print(f"load strategy: {strategy} ({plan_info})")
 
         start = time.perf_counter()
-        kwargs = {
-            "device": config["device"],
-            "dtype": dtype,
-            "max_seq_len": config["max_seq_len"],
-            "compression": config["compression"],
-            "profiling_mode": config["profiling_mode"],
-            "prefetching": config["prefetching"],
-            "cleanup_interval": config["cleanup_interval"],
-            "prefetch_workers": config["prefetch_workers"],
-            "reinitialize_model_each_forward": config["reinitialize_model_each_forward"],
-            "delete_original": config["delete_original"],
-        }
-        if config["layer_shards_saving_path"]:
-            kwargs["layer_shards_saving_path"] = config["layer_shards_saving_path"]
-        if config["hf_token"]:
-            kwargs["hf_token"] = config["hf_token"]
+        model = None
+        if strategy in ("direct_gpu", "direct_offload"):
+            try:
+                model = build_direct_model(config, dtype, strategy)
+            except Exception as exc:
+                print(f"direct load failed ({type(exc).__name__}: {exc}); falling back to AirLLM streaming")
+                model = None
+                gc.collect()
+                if torch is not None:
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                strategy = "airllm"
 
-        model = AutoModel.from_pretrained(config["model_id"], **kwargs)
+        if model is None:
+            strategy = "airllm"
+            from airllm import AutoModel
+
+            kwargs = {
+                "device": config["device"],
+                "dtype": dtype,
+                "max_seq_len": config["max_seq_len"],
+                "compression": config["compression"],
+                "profiling_mode": config["profiling_mode"],
+                "prefetching": config["prefetching"],
+                "cleanup_interval": config["cleanup_interval"],
+                "prefetch_workers": config["prefetch_workers"],
+                "reinitialize_model_each_forward": config["reinitialize_model_each_forward"],
+                "delete_original": config["delete_original"],
+            }
+            if config["layer_shards_saving_path"]:
+                kwargs["layer_shards_saving_path"] = config["layer_shards_saving_path"]
+            if config["hf_token"]:
+                kwargs["hf_token"] = config["hf_token"]
+
+            model = AutoModel.from_pretrained(config["model_id"], **kwargs)
         elapsed = time.perf_counter() - start
 
         MODEL_STATE["model"] = model
         MODEL_STATE["config"] = config
+        MODEL_STATE["mode"] = strategy
         MODEL_STATE["loaded_at"] = time.time()
         MODEL_STATE["load_seconds"] = round(elapsed, 2)
 
         status = current_status()
         status["reused"] = False
+        status["plan"] = plan_info
         return status
 
 
@@ -878,12 +1123,33 @@ def tokenize_prompt(
 
     if messages and use_chat_template and getattr(tokenizer, "chat_template", None):
         try:
-            input_ids = tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
+            # transformers 5.x returns a BatchEncoding (dict-like), NOT a bare tensor, so
+            # the old `input_ids.shape` raised AttributeError, was swallowed below, and the
+            # chat template was silently skipped (model got a raw prompt -> worse answers).
+            # Ask for the dict explicitly and pull out input_ids.
+            msgs = list(messages)
+
+            def _render(ms: list[Dict[str, str]]) -> Any:
+                return tokenizer.apply_chat_template(
+                    ms,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                    return_dict=True,
+                )["input_ids"]
+
+            input_ids = _render(msgs)
+            # If over budget, drop the OLDEST non-system turns and re-render, preserving the
+            # system prompt (persona/instructions) and the most recent turns. Left-truncating
+            # the raw token stream (old behavior) would chop the system prompt and split a
+            # message mid-token.
+            while input_ids.shape[-1] > max_length and len(msgs) > 1:
+                drop = next((i for i, m in enumerate(msgs) if m.get("role") != "system"), None)
+                if drop is None:
+                    break
+                del msgs[drop]
+                input_ids = _render(msgs)
             if input_ids.shape[-1] > max_length:
+                # Last resort (e.g. the system prompt alone exceeds the budget).
                 input_ids = input_ids[:, -max_length:]
             return input_ids
         except Exception:
@@ -891,11 +1157,13 @@ def tokenize_prompt(
 
     if use_chat_template and getattr(tokenizer, "chat_template", None):
         try:
-            input_ids = tokenizer.apply_chat_template(
+            encoded = tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True,
                 return_tensors="pt",
+                return_dict=True,
             )
+            input_ids = encoded["input_ids"]
             if input_ids.shape[-1] > max_length:
                 input_ids = input_ids[:, -max_length:]
             return input_ids
@@ -916,14 +1184,41 @@ def tokenize_prompt(
     return input_ids
 
 
+TASK_PRESETS: Dict[str, Dict[str, float]] = {
+    # chat / creative: lively but controlled (historical defaults)
+    "chat":    {"temperature": 0.7, "top_p": 0.9,  "top_k": 50, "repetition_penalty": 1.05},
+    # factual Q&A: low temperature, mild repetition penalty
+    "factual": {"temperature": 0.2, "top_p": 0.9,  "top_k": 40, "repetition_penalty": 1.1},
+    # code: greedy, NO repetition penalty (1.2 would punish legitimate indentation/braces)
+    "code":    {"temperature": 0.0, "top_p": 0.95, "top_k": 0,  "repetition_penalty": 1.0},
+}
+
+
 def generation_settings(payload: Dict[str, Any], model: Any, config: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
     max_model_len = int(getattr(model, "max_seq_len", config.get("max_seq_len", 512)))
-    max_length = parse_int(payload.get("max_length"), min(512, max_model_len), 16, max_model_len)
+    is_airllm = not bool(getattr(model, "_airllm_direct", False))
+
+    # Parse output length first so the prompt budget can be sized around it.
     max_new_tokens = parse_int(payload.get("max_new_tokens"), recommended_settings()["max_new_tokens"], 1, 4096)
-    temperature = parse_float(payload.get("temperature"), 0.7, 0.0, 2.0)
-    top_p = parse_float(payload.get("top_p"), 0.9, 0.05, 1.0)
-    top_k = parse_int(payload.get("top_k"), 50, 0, 1000)
-    repetition_penalty = parse_float(payload.get("repetition_penalty"), 1.05, 0.8, 2.0)
+    if is_airllm:
+        # AirLLM preallocates fixed max_seq_len attention-mask / position-id buffers, so
+        # prompt_tokens + max_new_tokens must never exceed max_seq_len (else it crashes
+        # mid-generation). Clamp both defensively, independent of UI input.
+        max_new_tokens = min(max_new_tokens, max(1, max_model_len - 16))
+        prompt_budget = max(16, max_model_len - max_new_tokens)
+        max_length = parse_int(payload.get("max_length"), prompt_budget, 16, max_model_len)
+        max_length = max(16, min(max_length, max_model_len - max_new_tokens))
+    else:
+        # Resident transformers models have no fixed buffer; only truncate the prompt.
+        max_length = parse_int(payload.get("max_length"), min(512, max_model_len), 16, max_model_len)
+
+    # Task-aware sampling defaults (chat / factual / code); explicit payload values win.
+    task_mode = str(payload.get("task_mode") or "chat").strip().lower()
+    preset = TASK_PRESETS.get(task_mode, TASK_PRESETS["chat"])
+    temperature = parse_float(payload.get("temperature"), preset["temperature"], 0.0, 2.0)
+    top_p = parse_float(payload.get("top_p"), preset["top_p"], 0.05, 1.0)
+    top_k = parse_int(payload.get("top_k"), int(preset["top_k"]), 0, 1000)
+    repetition_penalty = parse_float(payload.get("repetition_penalty"), preset["repetition_penalty"], 0.8, 2.0)
 
     generation_kwargs: Dict[str, Any] = {
         "max_new_tokens": max_new_tokens,
@@ -953,7 +1248,42 @@ def generation_settings(payload: Dict[str, Any], model: Any, config: Dict[str, A
             generation_kwargs["top_k"] = top_k
     else:
         generation_kwargs["do_sample"] = False
+
+    # Quality: some checkpoints ship an incomplete generation_config (no eos id), which
+    # causes run-on answers. Fall back to the tokenizer's eos/pad ONLY when the model
+    # itself defines none, so we never clobber a model's richer eos set (e.g. Llama 3.1's
+    # <|eot_id|>).
+    gen_cfg = getattr(model, "generation_config", None)
+    if getattr(gen_cfg, "eos_token_id", None) is None:
+        tok = getattr(model, "tokenizer", None)
+        tok_eos = getattr(tok, "eos_token_id", None)
+        if tok_eos is not None:
+            generation_kwargs["eos_token_id"] = tok_eos
+            if getattr(gen_cfg, "pad_token_id", None) is None:
+                generation_kwargs["pad_token_id"] = getattr(tok, "pad_token_id", None) or tok_eos
+
+    # Lossless speedup on the RESIDENT path only: prompt-lookup decoding verifies several
+    # context-matched candidate tokens per forward (1.5-3x on echo-heavy code/RAG/refactor
+    # output that quotes its context, ~1x otherwise). Greedy => bit-identical output;
+    # sampling => distribution-preserving. Never enable on the AirLLM streaming path: its
+    # fixed-size buffers + per-token disk re-stream make a multi-token candidate forward
+    # both unsafe and pointless. Default on for the greedy 'code' preset; opt-in elsewhere.
+    if not is_airllm and generation_kwargs["use_cache"]:
+        if task_mode == "code" or parse_bool(payload.get("prompt_lookup"), False):
+            generation_kwargs["prompt_lookup_num_tokens"] = parse_int(payload.get("prompt_lookup_num_tokens"), 10, 1, 32)
+            generation_kwargs["max_matching_ngram_size"] = parse_int(payload.get("max_matching_ngram_size"), 2, 1, 8)
+
     return max_length, generation_kwargs
+
+
+def resolve_input_device(model: Any, config: Dict[str, Any]) -> Any:
+    """Where to put input_ids. For a resident (direct) model with accelerate offload the
+    inputs must go to the model's input/embedding device, not the configured device."""
+    if getattr(model, "_airllm_direct", False):
+        dev = getattr(model, "device", None)
+        if dev is not None:
+            return dev
+    return config["device"]
 
 
 def run_generation(
@@ -983,7 +1313,11 @@ def run_generation(
 
         max_length, generation_kwargs = generation_settings(payload, model, config)
         input_ids = tokenize_prompt(model, prompt, max_length, use_chat_template, messages=messages)
-        input_ids = input_ids.to(config["device"])
+        input_ids = input_ids.to(resolve_input_device(model, config))
+        if getattr(model, "_airllm_direct", False):
+            # Resident HF models infer padding from the attention mask; pass an explicit
+            # all-ones mask (single unpadded sequence) so a trailing eos==pad isn't misread.
+            generation_kwargs["attention_mask"] = torch.ones_like(input_ids)
 
         GENERATION_CANCEL.clear()
         start = time.perf_counter()
@@ -1096,7 +1430,7 @@ def generate_text(payload: Dict[str, Any]) -> Dict[str, Any]:
     return run_generation(payload, prompt)
 
 
-def chat_completion(payload: Dict[str, Any]) -> Dict[str, Any]:
+def prepare_chat_messages(payload: Dict[str, Any]) -> list[Dict[str, str]]:
     messages = normalize_messages(payload.get("messages"))
     if not messages:
         raise ValueError("A chathez legalabb egy user uzenet kell.")
@@ -1112,6 +1446,11 @@ def chat_completion(payload: Dict[str, Any]) -> Dict[str, Any]:
         ).strip()
         if system_prompt:
             messages = [{"role": "system", "content": system_prompt}] + messages
+    return messages
+
+
+def chat_completion(payload: Dict[str, Any]) -> Dict[str, Any]:
+    messages = prepare_chat_messages(payload)
 
     if is_external_provider(payload):
         result = external_chat_request(payload, messages)
@@ -1126,6 +1465,90 @@ def chat_completion(payload: Dict[str, Any]) -> Dict[str, Any]:
         **result,
         "message": {"role": "assistant", "content": result["text"]},
     }
+
+
+def run_generation_stream(payload: Dict[str, Any], prompt: str, messages: Optional[list[Dict[str, str]]] = None):
+    """Yield {'token': str} events as the local model produces them, then a final
+    {'done': True, ...} event. Streams via a background generate() thread feeding a
+    TextIteratorStreamer; MODEL_LOCK is held for the whole generation (releasing it
+    per token would corrupt the shared meta-model / KV cache)."""
+    if parse_bool(payload.get("autoload"), True):
+        load_model(payload.get("load_config") or payload)
+
+    from transformers import TextIteratorStreamer
+
+    with MODEL_LOCK:
+        model = MODEL_STATE["model"]
+        config = MODEL_STATE["config"]
+        if model is None or config is None:
+            raise RuntimeError("Nincs betoltott modell.")
+
+        prompt = (prompt or "").strip()
+        if not prompt:
+            raise ValueError("Adj meg promptot.")
+
+        torch, torch_error = get_torch()
+        if torch is None:
+            raise RuntimeError(f"PyTorch nem importalhato: {torch_error}")
+
+        use_chat_template = parse_bool(payload.get("use_chat_template"), True)
+        max_length, generation_kwargs = generation_settings(payload, model, config)
+        input_ids = tokenize_prompt(model, prompt, max_length, use_chat_template, messages=messages)
+        input_ids = input_ids.to(resolve_input_device(model, config))
+
+        streamer = TextIteratorStreamer(model.tokenizer, skip_prompt=True, skip_special_tokens=True)
+        generation_kwargs["streamer"] = streamer
+        generation_kwargs.pop("return_dict_in_generate", None)
+        if getattr(model, "_airllm_direct", False):
+            generation_kwargs["attention_mask"] = torch.ones_like(input_ids)
+
+        GENERATION_CANCEL.clear()
+        start = time.perf_counter()
+        worker_state: Dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                with torch.inference_mode():
+                    out = model.generate(input_ids, **generation_kwargs)
+                # generate() (no return_dict_in_generate here) returns the full sequence
+                # tensor; record real new-token count for accurate tok/s in the done event.
+                try:
+                    worker_state["output_tokens"] = int(out.shape[-1] - input_ids.shape[-1])
+                except Exception:
+                    pass
+            except Exception as exc:  # surfaced as a final error event
+                worker_state["error"] = f"{type(exc).__name__}: {exc}"
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+
+        output_chars = 0
+        for chunk in streamer:
+            if chunk:
+                output_chars += len(chunk)
+                yield {"token": chunk}
+            if GENERATION_CANCEL.is_set():
+                break
+
+        worker.join()
+        elapsed = time.perf_counter() - start
+        cancelled = GENERATION_CANCEL.is_set()
+        GENERATION_CANCEL.clear()
+
+        output_tokens = worker_state.get("output_tokens")
+        done: Dict[str, Any] = {
+            "done": True,
+            "seconds": round(elapsed, 2),
+            "input_tokens": int(input_ids.shape[-1]),
+            "output_chars": output_chars,
+            "output_tokens": output_tokens,
+            "tokens_per_second": round(output_tokens / elapsed, 1) if output_tokens and elapsed > 0 else None,
+            "cancelled": cancelled,
+            "status": current_status(),
+        }
+        if "error" in worker_state:
+            done["error"] = worker_state["error"]
+        yield done
 
 
 def resolve_workspace(path_value: Any) -> Path:
@@ -1286,6 +1709,32 @@ def json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 2
     handler.wfile.write(body)
 
 
+def sse_response(handler: BaseHTTPRequestHandler, events: Any) -> None:
+    """Stream an iterable of dict events as Server-Sent Events. Because the 200 headers
+    are sent before iteration begins, any error raised while iterating is emitted as a
+    data event (we cannot switch to a 500 afterwards)."""
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("X-Accel-Buffering", "no")
+    handler.send_header("Connection", "close")
+    handler.end_headers()
+    try:
+        for event in events:
+            chunk = "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+            handler.wfile.write(chunk.encode("utf-8"))
+            handler.wfile.flush()
+        handler.wfile.write(b"data: [DONE]\n\n")
+        handler.wfile.flush()
+    except Exception as exc:
+        try:
+            err = "data: " + json.dumps({"error": str(exc)}, ensure_ascii=False) + "\n\n"
+            handler.wfile.write(err.encode("utf-8"))
+            handler.wfile.flush()
+        except Exception:
+            pass
+
+
 def text_response(handler: BaseHTTPRequestHandler, payload: str, content_type: str = "text/html; charset=utf-8") -> None:
     body = payload.encode("utf-8")
     handler.send_response(200)
@@ -1336,6 +1785,9 @@ def read_json(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
 
 class AirLLMHandler(BaseHTTPRequestHandler):
     server_version = "AirLLMUI/1.0"
+    # Disable Nagle's algorithm so SSE token frames flush immediately instead of being
+    # coalesced (can otherwise add up to ~40ms latency per small frame off-loopback).
+    disable_nagle_algorithm = True
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -1367,9 +1819,16 @@ class AirLLMHandler(BaseHTTPRequestHandler):
             if path == "/api/load":
                 json_response(self, load_model(payload))
             elif path == "/api/generate":
-                json_response(self, generate_text(payload))
+                if parse_bool(payload.get("stream"), False) and not is_external_provider(payload):
+                    sse_response(self, run_generation_stream(payload, (payload.get("prompt") or "").strip()))
+                else:
+                    json_response(self, generate_text(payload))
             elif path == "/api/chat":
-                json_response(self, chat_completion(payload))
+                if parse_bool(payload.get("stream"), False) and not is_external_provider(payload):
+                    messages = prepare_chat_messages(payload)
+                    sse_response(self, run_generation_stream(payload, messages_to_prompt(messages), messages=messages))
+                else:
+                    json_response(self, chat_completion(payload))
             elif path == "/api/agent/run":
                 json_response(self, run_coding_agent(payload))
             elif path == "/api/unload":
@@ -1388,548 +1847,6 @@ class AirLLMHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[{self.log_date_time_string()}] {fmt % args}")
 
-
-HTML = r"""<!doctype html>
-<html lang="hu">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AirLLM Control</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f6f7f9;
-      --panel: #ffffff;
-      --panel-2: #eef2f4;
-      --ink: #15191d;
-      --muted: #626c77;
-      --line: #d7dde3;
-      --accent: #0f766e;
-      --accent-2: #155e75;
-      --danger: #b42318;
-      --ok: #167647;
-      --warn: #a15c07;
-      --shadow: 0 14px 40px rgba(18, 31, 45, .08);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      background: var(--bg);
-      color: var(--ink);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      letter-spacing: 0;
-    }
-    header {
-      position: sticky;
-      top: 0;
-      z-index: 2;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 14px 22px;
-      border-bottom: 1px solid var(--line);
-      background: rgba(246, 247, 249, .94);
-      backdrop-filter: blur(14px);
-    }
-    h1 {
-      margin: 0;
-      font-size: 19px;
-      font-weight: 760;
-      letter-spacing: 0;
-    }
-    main {
-      display: grid;
-      grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
-      gap: 18px;
-      width: min(1480px, 100%);
-      margin: 0 auto;
-      padding: 18px;
-    }
-    section {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      box-shadow: var(--shadow);
-    }
-    .left, .right {
-      display: flex;
-      flex-direction: column;
-      min-width: 0;
-    }
-    .block {
-      padding: 16px;
-      border-bottom: 1px solid var(--line);
-    }
-    .block:last-child { border-bottom: 0; }
-    .block-title {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      margin-bottom: 12px;
-      font-size: 13px;
-      font-weight: 760;
-      text-transform: uppercase;
-      color: #2a333c;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-    }
-    label {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      min-width: 0;
-      font-size: 12px;
-      font-weight: 650;
-      color: #303943;
-    }
-    input, select, textarea {
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #fff;
-      color: var(--ink);
-      font: inherit;
-      font-size: 14px;
-      min-height: 38px;
-      padding: 8px 10px;
-      outline: none;
-    }
-    textarea {
-      min-height: 220px;
-      resize: vertical;
-      line-height: 1.45;
-    }
-    input:focus, select:focus, textarea:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 3px rgba(15, 118, 110, .12);
-    }
-    button {
-      border: 0;
-      border-radius: 6px;
-      background: var(--accent);
-      color: #fff;
-      font: inherit;
-      font-size: 14px;
-      font-weight: 720;
-      min-height: 38px;
-      padding: 8px 12px;
-      cursor: pointer;
-    }
-    button.secondary { background: var(--accent-2); }
-    button.ghost {
-      background: transparent;
-      color: var(--accent-2);
-      border: 1px solid var(--line);
-    }
-    button.danger { background: var(--danger); }
-    button:disabled {
-      opacity: .58;
-      cursor: wait;
-    }
-    .actions {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-    .status {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      min-width: 0;
-      font-size: 13px;
-      color: var(--muted);
-      white-space: nowrap;
-    }
-    .dot {
-      width: 9px;
-      height: 9px;
-      border-radius: 999px;
-      background: var(--warn);
-      flex: 0 0 auto;
-    }
-    .dot.ok { background: var(--ok); }
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 8px;
-    }
-    .metric {
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--panel-2);
-      padding: 9px 10px;
-      min-height: 58px;
-    }
-    .metric b {
-      display: block;
-      margin-bottom: 3px;
-      font-size: 12px;
-      color: var(--muted);
-      font-weight: 680;
-    }
-    .metric span {
-      display: block;
-      overflow-wrap: anywhere;
-      font-size: 14px;
-      font-weight: 720;
-    }
-    .output {
-      min-height: 320px;
-      padding: 16px;
-      background: #111820;
-      color: #eff6ff;
-      border-radius: 7px;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      line-height: 1.5;
-      font-size: 15px;
-    }
-    .log {
-      min-height: 90px;
-      max-height: 170px;
-      overflow: auto;
-      padding: 10px;
-      border-radius: 6px;
-      background: #f0f3f6;
-      color: #27323c;
-      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
-      font-size: 12px;
-      line-height: 1.45;
-      white-space: pre-wrap;
-    }
-    .toggle-row {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 8px 14px;
-    }
-    .check {
-      flex-direction: row;
-      align-items: center;
-      gap: 8px;
-      min-height: 32px;
-    }
-    .check input {
-      width: 17px;
-      min-height: 17px;
-    }
-    @media (max-width: 920px) {
-      main { grid-template-columns: 1fr; padding: 12px; }
-      header { padding: 12px; align-items: flex-start; flex-direction: column; }
-    }
-    @media (max-width: 560px) {
-      .grid, .metrics, .toggle-row { grid-template-columns: 1fr; }
-      textarea { min-height: 170px; }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>AirLLM Control</h1>
-    <div class="status"><span id="statusDot" class="dot"></span><span id="statusText">Betoltes...</span></div>
-  </header>
-  <main>
-    <section class="left">
-      <div class="block">
-        <div class="block-title">Hardver</div>
-        <div id="hardware" class="metrics"></div>
-      </div>
-      <div class="block">
-        <div class="block-title">Modell</div>
-        <div class="grid">
-          <label style="grid-column: 1 / -1;">Preset
-            <select id="preset"></select>
-          </label>
-          <label style="grid-column: 1 / -1;">Model ID / utvonal
-            <input id="model_id" spellcheck="false" />
-          </label>
-          <label>Device
-            <select id="device">
-              <option value="auto">auto</option>
-              <option value="cuda:0">cuda:0</option>
-              <option value="cpu">cpu</option>
-            </select>
-          </label>
-          <label>Dtype
-            <select id="dtype">
-              <option value="auto">auto</option>
-              <option value="float16">float16</option>
-              <option value="bfloat16">bfloat16</option>
-              <option value="float32">float32</option>
-            </select>
-          </label>
-          <label>Compression
-            <select id="compression">
-              <option value="auto">auto</option>
-              <option value="none">none</option>
-              <option value="4bit">4bit</option>
-              <option value="8bit">8bit</option>
-            </select>
-          </label>
-          <label>Prefetching
-            <select id="prefetching">
-              <option value="auto">auto</option>
-              <option value="true">on</option>
-              <option value="false">off</option>
-            </select>
-          </label>
-          <label>Max seq len
-            <input id="max_seq_len" type="number" min="128" max="32768" step="128" />
-          </label>
-          <label>Layer cache
-            <input id="layer_shards_saving_path" placeholder="" />
-          </label>
-          <label style="grid-column: 1 / -1;">HF token
-            <input id="hf_token" type="password" autocomplete="off" />
-          </label>
-        </div>
-        <div class="toggle-row" style="margin-top: 10px;">
-          <label class="check"><input id="profiling_mode" type="checkbox" />Profiling</label>
-          <label class="check"><input id="delete_original" type="checkbox" />Delete original</label>
-        </div>
-        <div class="actions" style="margin-top: 12px;">
-          <button id="loadBtn">Betolt</button>
-          <button id="unloadBtn" class="danger">Kiurit</button>
-          <button id="optBtn" class="ghost">Optimalizal</button>
-        </div>
-      </div>
-      <div class="block">
-        <div class="block-title">Napló</div>
-        <div id="log" class="log"></div>
-      </div>
-    </section>
-    <section class="right">
-      <div class="block">
-        <div class="block-title">Prompt</div>
-        <textarea id="prompt" spellcheck="true">Szia! Foglald ossze roviden, mire jo az AirLLM.</textarea>
-      </div>
-      <div class="block">
-        <div class="block-title">Generálás</div>
-        <div class="grid">
-          <label>Input max
-            <input id="max_length" type="number" min="16" max="32768" step="16" value="512" />
-          </label>
-          <label>New tokens
-            <input id="max_new_tokens" type="number" min="1" max="4096" step="1" value="128" />
-          </label>
-          <label>Temperature
-            <input id="temperature" type="number" min="0" max="2" step="0.05" value="0.7" />
-          </label>
-          <label>Top p
-            <input id="top_p" type="number" min="0.05" max="1" step="0.01" value="0.9" />
-          </label>
-          <label>Top k
-            <input id="top_k" type="number" min="0" max="1000" step="1" value="50" />
-          </label>
-          <label>Repeat penalty
-            <input id="repetition_penalty" type="number" min="0.8" max="2" step="0.01" value="1.05" />
-          </label>
-        </div>
-        <div class="toggle-row" style="margin-top: 10px;">
-          <label class="check"><input id="autoload" type="checkbox" checked />Autoload</label>
-          <label class="check"><input id="use_cache" type="checkbox" checked />KV cache</label>
-          <label class="check"><input id="use_chat_template" type="checkbox" checked />Chat template</label>
-        </div>
-        <div class="actions" style="margin-top: 12px;">
-          <button id="generateBtn" class="secondary">General</button>
-        </div>
-      </div>
-      <div class="block">
-        <div class="block-title">Kimenet</div>
-        <div id="output" class="output"></div>
-      </div>
-    </section>
-  </main>
-  <script>
-    const $ = (id) => document.getElementById(id);
-    const logEl = $("log");
-    let presets = [];
-
-    function log(message) {
-      const stamp = new Date().toLocaleTimeString();
-      logEl.textContent = `[${stamp}] ${message}\n` + logEl.textContent;
-    }
-
-    function setBusy(busy) {
-      for (const id of ["loadBtn", "unloadBtn", "optBtn", "generateBtn"]) {
-        $(id).disabled = busy;
-      }
-    }
-
-    async function api(path, options = {}) {
-      const res = await fetch(path, {
-        headers: {"Content-Type": "application/json"},
-        ...options,
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        const err = new Error(data.error || "Hiba");
-        err.traceback = data.traceback;
-        throw err;
-      }
-      return data;
-    }
-
-    function metric(label, value) {
-      return `<div class="metric"><b>${label}</b><span>${value ?? "-"}</span></div>`;
-    }
-
-    async function refreshHardware() {
-      const hw = await api("/api/hardware");
-      const gpu = hw.cuda.available && hw.cuda.devices.length
-        ? hw.cuda.devices.map(d => `${d.name} (${d.total_memory_gb} GB)`).join(", ")
-        : "nincs CUDA";
-      $("hardware").innerHTML = [
-        metric("CPU", `${hw.cpu.logical_cores} szal`),
-        metric("RAM", `${hw.memory.available_gb ?? "?"} / ${hw.memory.total_gb ?? "?"} GB`),
-        metric("GPU", gpu),
-        metric("Torch", hw.torch.version || "nem elerheto"),
-        metric("bitsandbytes", hw.bitsandbytes.available ? "elerheto" : "nem elerheto"),
-        metric("HF cache", `${hw.disk.free_gb ?? "?"} GB szabad`),
-      ].join("");
-
-      const rec = hw.recommendation;
-      $("device").value = "auto";
-      $("dtype").value = "auto";
-      $("compression").value = "auto";
-      $("prefetching").value = "auto";
-      $("max_seq_len").value = rec.max_seq_len;
-      $("max_new_tokens").value = rec.max_new_tokens;
-      $("max_length").value = Math.min(512, rec.max_seq_len);
-      log(`ajanlott: ${rec.device}, ${rec.dtype}, compression=${rec.compression}, max_seq_len=${rec.max_seq_len}`);
-    }
-
-    async function refreshPresets() {
-      const data = await api("/api/presets");
-      presets = data.presets;
-      $("preset").innerHTML = `<option value="">Egyedi model ID</option>` +
-        presets.map((p, i) => `<option value="${i}">${p.label} - ${p.family}</option>`).join("");
-      $("preset").value = "0";
-      $("model_id").value = presets[0].model_id;
-    }
-
-    async function refreshStatus() {
-      const status = await api("/api/status");
-      $("statusDot").className = status.loaded ? "dot ok" : "dot";
-      $("statusText").textContent = status.loaded
-        ? `Betoltve: ${status.config.model_id} (${status.load_seconds}s)`
-        : "Nincs betoltott modell";
-    }
-
-    function loadConfig() {
-      return {
-        model_id: $("model_id").value,
-        device: $("device").value,
-        dtype: $("dtype").value,
-        compression: $("compression").value,
-        prefetching: $("prefetching").value,
-        max_seq_len: $("max_seq_len").value,
-        layer_shards_saving_path: $("layer_shards_saving_path").value,
-        hf_token: $("hf_token").value,
-        profiling_mode: $("profiling_mode").checked,
-        delete_original: $("delete_original").checked,
-      };
-    }
-
-    function generationConfig() {
-      return {
-        ...loadConfig(),
-        load_config: loadConfig(),
-        prompt: $("prompt").value,
-        max_length: $("max_length").value,
-        max_new_tokens: $("max_new_tokens").value,
-        temperature: $("temperature").value,
-        top_p: $("top_p").value,
-        top_k: $("top_k").value,
-        repetition_penalty: $("repetition_penalty").value,
-        autoload: $("autoload").checked,
-        use_cache: $("use_cache").checked,
-        use_chat_template: $("use_chat_template").checked,
-      };
-    }
-
-    $("preset").addEventListener("change", () => {
-      const idx = $("preset").value;
-      if (idx !== "") $("model_id").value = presets[Number(idx)].model_id;
-    });
-
-    $("loadBtn").addEventListener("click", async () => {
-      setBusy(true);
-      log("modell betoltese indul");
-      try {
-        const status = await api("/api/load", {method: "POST", body: JSON.stringify(loadConfig())});
-        log(status.reused ? "mar be volt toltve" : `betoltes kesz: ${status.load_seconds}s`);
-        await refreshStatus();
-      } catch (err) {
-        log(err.message);
-        if (err.traceback) console.error(err.traceback);
-      } finally {
-        setBusy(false);
-      }
-    });
-
-    $("unloadBtn").addEventListener("click", async () => {
-      setBusy(true);
-      try {
-        await api("/api/unload", {method: "POST", body: "{}"});
-        $("output").textContent = "";
-        log("modell kiuritve");
-        await refreshStatus();
-      } catch (err) {
-        log(err.message);
-      } finally {
-        setBusy(false);
-      }
-    });
-
-    $("optBtn").addEventListener("click", async () => {
-      setBusy(true);
-      try {
-        const data = await api("/api/optimize", {method: "POST", body: "{}"});
-        log(`optimalizalva: cpu_threads=${data.cpu_threads}, tf32=${data.tf32}`);
-      } catch (err) {
-        log(err.message);
-      } finally {
-        setBusy(false);
-      }
-    });
-
-    $("generateBtn").addEventListener("click", async () => {
-      setBusy(true);
-      $("output").textContent = "Dolgozom...";
-      log("generalas indul");
-      try {
-        const data = await api("/api/generate", {method: "POST", body: JSON.stringify(generationConfig())});
-        $("output").textContent = data.text;
-        log(`kesz: ${data.seconds}s, input=${data.input_tokens}, output=${data.output_tokens}`);
-        await refreshStatus();
-      } catch (err) {
-        $("output").textContent = err.message;
-        log(err.message);
-        if (err.traceback) console.error(err.traceback);
-      } finally {
-        setBusy(false);
-      }
-    });
-
-    (async function boot() {
-      try {
-        await refreshPresets();
-        await refreshHardware();
-        await refreshStatus();
-      } catch (err) {
-        log(err.message);
-      }
-    })();
-  </script>
-</body>
-</html>
-"""
 
 HTML = """<!doctype html>
 <html lang="hu">
