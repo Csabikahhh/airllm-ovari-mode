@@ -13,6 +13,9 @@ psutil>=6
 # Optional GPU compression path. On Windows/CUDA this may require a matching wheel;
 # install separately if pip cannot resolve one for your Python/CUDA version:
 #   pip install bitsandbytes
+#
+# Optional macOS Apple Silicon fallback path for upstream AirLLM/MLX:
+#   pip install mlx
 
 # Development / evaluation helpers kept from the original project.
 evaluate>=0.4

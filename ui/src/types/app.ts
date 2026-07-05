@@ -49,6 +49,16 @@ export type HardwareProfile = {
       compute_capability: string
     }>
   }
+  mps: {
+    available: boolean
+    built: boolean
+    error: string | null
+  }
+  mlx: {
+    available: boolean
+    version: string | null
+    error: string | null
+  }
   torch: {
     available: boolean
     version: string | null
@@ -58,6 +68,7 @@ export type HardwareProfile = {
     available: boolean
   }
   supported_families: string[]
+  device_options: string[]
   recommendation: {
     device: string
     dtype: string
@@ -81,6 +92,7 @@ export type Status = {
     device?: string
     dtype?: string
     compression?: string | null
+    load_mode?: string
     max_seq_len?: number
     prefetching?: boolean
     cleanup_interval?: number
@@ -98,6 +110,7 @@ export type LoadForm = {
   device: string
   dtype: string
   compression: string
+  load_mode: string
   prefetching: string
   cleanup_interval: string
   prefetch_workers: string
@@ -159,4 +172,61 @@ export type BenchmarkResult = {
     output_tokens?: number
     error?: string
   }
+}
+
+export type CachedModel = {
+  model_id: string
+  path: string
+  size_bytes: number
+  size_gb: number
+  modified_at: number | null
+  snapshots: number
+}
+
+export type ModelDownloadStatus = {
+  active: boolean
+  status: "idle" | "preparing" | "downloading" | "cancelling" | "cancelled" | "cached" | "done" | "error"
+  model_id: string | null
+  path: string | null
+  current_file: string | null
+  total_bytes: number
+  downloaded_bytes: number
+  downloaded_gb: number
+  total_gb: number
+  files_total: number
+  files_cached: number
+  files_to_download: number
+  started_at: number | null
+  finished_at: number | null
+  elapsed_seconds: number
+  eta_seconds: number | null
+  percent: number | null
+  error: string | null
+}
+
+export type ModelCacheInfo = {
+  cache_dir: string
+  models: CachedModel[]
+  total_size_bytes: number
+  total_size_gb: number
+  download: ModelDownloadStatus
+}
+
+export type HuggingFaceModel = {
+  model_id: string
+  downloads: number | null
+  likes: number | null
+  pipeline_tag: string | null
+  library_name: string | null
+  private: boolean
+  gated: boolean | string | null
+  tags: string[]
+  last_modified: string | null
+}
+
+export type HuggingFaceModelsResponse = {
+  query: string
+  task: string | null
+  limit: number
+  models: HuggingFaceModel[]
 }

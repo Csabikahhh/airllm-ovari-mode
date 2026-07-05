@@ -11,11 +11,13 @@ export const configHints = {
   modelId:
     "Hugging Face modell ID vagy helyi utvonal (pl. Qwen/Qwen2.5-Coder-3B-Instruct). Ezt tolti be az AirLLM.",
   device:
-    "Hol fusson a modell: auto a hardver alapjan valaszt, cuda:0 NVIDIA GPU-n, cpu csak processzoron.",
+    "Hol fusson a modell: auto a hardver alapjan valaszt, cuda:0 NVIDIA GPU-n, mps Apple Silicon/Metal rendszeren, cpu processzoron.",
   dtype:
     "Szamitas pontossaga: float16/bfloat16 gyorsabb GPU-n, float32 pontosabb, auto a rendszer ajanlja.",
   compression:
     "Modell tomoritese memoriaba: 4bit/8bit kevesebb RAM-ot/GPU memoriát hasznal, none teljes pontossag.",
+  loadMode:
+    "Auto valaszt. GPU/MPS rezidens a leggyorsabb, ha belefer. CPU+GPU hybrid CUDA-n megosztja a modell retegeit VRAM es RAM kozott. AirLLM streaming nagyon nagy modellekhez lassabb fallback.",
   prefetching:
     "Kovetkezo modell retegek elore betoltese CPU/GPU kozott. Gyorsitja a generalast nagy modelleknél.",
   maxSeqLen:

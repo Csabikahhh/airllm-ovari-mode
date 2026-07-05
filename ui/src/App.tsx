@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react"
+import Swal from "sweetalert2"
+import "sweetalert2/dist/sweetalert2.min.css"
 import {
   Bot,
   Code2,
@@ -39,7 +41,10 @@ import type {
   ChatMessage,
   GenerateForm,
   HardwareProfile,
+  HuggingFaceModelsResponse,
   LoadForm,
+  ModelCacheInfo,
+  ModelDownloadStatus,
   Preset,
   ProviderForm,
   ProviderPreset,
@@ -51,6 +56,7 @@ const defaultLoadForm: LoadForm = {
   device: "auto",
   dtype: "auto",
   compression: "auto",
+  load_mode: "auto",
   prefetching: "auto",
   cleanup_interval: "4",
   prefetch_workers: "1",
@@ -104,6 +110,31 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(message)
   }
   return payload as T
+}
+
+async function confirmModelDelete(modelId: string) {
+  const result = await Swal.fire({
+    title: "Modell törlése?",
+    text: `Töröljem ezt a modellt a Hugging Face cache-ből?\n\n${modelId}`,
+    icon: "warning",
+    showCancelButton: true,
+    confirmButtonText: "Törlés",
+    cancelButtonText: "Mégse",
+    reverseButtons: true,
+    focusCancel: true,
+    buttonsStyling: false,
+    customClass: {
+      popup: "rounded-lg border border-border bg-card text-foreground shadow-xl",
+      title: "text-lg font-semibold text-foreground",
+      htmlContainer: "whitespace-pre-wrap break-words text-sm text-muted-foreground",
+      actions: "gap-2",
+      confirmButton:
+        "inline-flex h-10 items-center justify-center rounded-md bg-destructive px-4 text-sm font-medium text-white shadow-xs transition-colors hover:bg-destructive/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+      cancelButton:
+        "inline-flex h-10 items-center justify-center rounded-md border bg-background px-4 text-sm font-medium text-foreground shadow-xs transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+    },
+  })
+  return result.isConfirmed
 }
 
 type StreamSummary = {
@@ -276,17 +307,28 @@ function App() {
   const [agentContextChars, setAgentContextChars] = useState("16000")
   const [agentOutput, setAgentOutput] = useState<AgentResponse | null>(null)
   const [benchmark, setBenchmark] = useState<BenchmarkResult | null>(null)
+  const [modelCache, setModelCache] = useState<ModelCacheInfo | null>(null)
+  const [downloadStatus, setDownloadStatus] = useState<ModelDownloadStatus | null>(null)
+  const [hfModels, setHfModels] = useState<HuggingFaceModelsResponse | null>(null)
+  const [hfModelQuery, setHfModelQuery] = useState("Qwen2.5 Instruct")
+  const [hfModelsBusy, setHfModelsBusy] = useState(false)
   const [logs, setLogs] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
+  const [cacheBusy, setCacheBusy] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [initializing, setInitializing] = useState(true)
   const streamAbortRef = useRef<AbortController | null>(null)
 
   const gpuLabel = useMemo(() => {
-    if (!hardware?.cuda.available || !hardware.cuda.devices.length) return "nincs CUDA"
-    return hardware.cuda.devices
-      .map((device) => `${device.name} (${device.total_memory_gb ?? "?"} GB)`)
-      .join(", ")
+    if (hardware?.cuda.available && hardware.cuda.devices.length) {
+      return hardware.cuda.devices
+        .map((device) => `${device.name} (${device.total_memory_gb ?? "?"} GB)`)
+        .join(", ")
+    }
+    if (hardware?.mps.available) return "Apple Metal / MPS"
+    if (hardware?.mps.built) return "MPS telepitve, nem elerheto"
+    if (hardware?.platform.toLowerCase().includes("darwin")) return "Mac CPU fallback"
+    return "nincs CUDA/MPS"
   }, [hardware])
 
   function addLog(message: string) {
@@ -358,6 +400,33 @@ function App() {
     }
   }
 
+  async function refreshModelCache() {
+    const data = await api<ModelCacheInfo>("/api/models")
+    setModelCache(data)
+    setDownloadStatus(data.download)
+  }
+
+  async function refreshDownloadStatus() {
+    const data = await api<ModelDownloadStatus>("/api/download/status")
+    setDownloadStatus(data)
+  }
+
+  async function refreshHfModels(query = hfModelQuery) {
+    setHfModelsBusy(true)
+    try {
+      const params = new URLSearchParams({
+        q: query.trim() || "Qwen2.5 Instruct",
+        limit: "20",
+      })
+      const data = await api<HuggingFaceModelsResponse>(`/api/hf-models?${params}`)
+      setHfModels(data)
+    } catch (error) {
+      addLog(error instanceof Error ? error.message : "Hugging Face lista hiba")
+    } finally {
+      setHfModelsBusy(false)
+    }
+  }
+
   function requestPayload() {
     return {
       ...loadForm,
@@ -376,6 +445,7 @@ function App() {
       })
       setStatus(nextStatus)
       addLog(nextStatus.reused ? "a modell mar be volt toltve" : `betoltes kesz: ${nextStatus.load_seconds}s`)
+      await refreshModelCache()
     } catch (error) {
       addLog(error instanceof Error ? error.message : "Betoltesi hiba")
     } finally {
@@ -399,6 +469,75 @@ function App() {
     } finally {
       setBusy(false)
     }
+  }
+
+  async function handleDownloadModel(modelIdOverride?: string) {
+    const modelId = (modelIdOverride ?? loadForm.model_id).trim()
+    if (modelIdOverride) {
+      setPresetIndex("custom")
+      updateLoad("model_id", modelId)
+    }
+    setCacheBusy(true)
+    addLog(`letoltes inditasa: ${modelId}`)
+    try {
+      const next = await api<ModelDownloadStatus>("/api/download", {
+        method: "POST",
+        body: JSON.stringify({
+          model_id: modelId,
+          hf_token: loadForm.hf_token,
+        }),
+      })
+      setDownloadStatus(next)
+    } catch (error) {
+      addLog(error instanceof Error ? error.message : "Letoltesi hiba")
+    } finally {
+      setCacheBusy(false)
+    }
+  }
+
+  async function handleCancelDownload() {
+    addLog("modell letoltes leallitasa")
+    try {
+      const next = await api<ModelDownloadStatus>("/api/download/cancel", {
+        method: "POST",
+        body: "{}",
+      })
+      setDownloadStatus(next)
+    } catch (error) {
+      addLog(error instanceof Error ? error.message : "Letoltes megszakitasi hiba")
+    }
+  }
+
+  async function handleDeleteCachedModel(modelId: string) {
+    if (!(await confirmModelDelete(modelId))) return
+    setCacheBusy(true)
+    addLog(`cache torles indul: ${modelId}`)
+    try {
+      const next = await api<ModelCacheInfo & { deleted?: boolean; deleted_gb?: number }>("/api/models/delete", {
+        method: "POST",
+        body: JSON.stringify({ model_id: modelId, unload_if_loaded: true }),
+      })
+      setModelCache(next)
+      setDownloadStatus(next.download)
+      await Promise.allSettled([refreshStatus(), refreshHardware()])
+      addLog(next.deleted ? `torolve: ${modelId}, ${next.deleted_gb ?? "?"} GB` : "nincs torolheto cache")
+    } catch (error) {
+      addLog(error instanceof Error ? error.message : "Torlesi hiba")
+    } finally {
+      setCacheBusy(false)
+    }
+  }
+
+  function handleUseCachedModel(modelId: string) {
+    setPresetIndex("custom")
+    updateLoad("model_id", modelId)
+    addLog(`kivalasztva: ${modelId}`)
+  }
+
+  function handleUseHfModel(modelId: string) {
+    setPresetIndex("custom")
+    updateLoad("model_id", modelId)
+    addLog(`HF modell kivalasztva: ${modelId}`)
   }
 
   async function handleCancel() {
@@ -618,6 +757,8 @@ function App() {
         refreshProviders(),
         refreshHardware(),
         refreshStatus(),
+        refreshModelCache(),
+        refreshHfModels(),
       ])
       for (const result of results) {
         if (result.status === "rejected") {
@@ -631,6 +772,20 @@ function App() {
       streamAbortRef.current?.abort()
     }
   }, [])
+
+  useEffect(() => {
+    if (!downloadStatus?.active) return
+    const timer = window.setInterval(() => {
+      void refreshDownloadStatus()
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [downloadStatus?.active])
+
+  useEffect(() => {
+    if (downloadStatus?.status !== "done") return
+    void refreshModelCache()
+    addLog(`letoltes kesz: ${downloadStatus.model_id}`)
+  }, [downloadStatus?.status])
 
   const statusLabel = initializing
     ? "Betoltes..."
@@ -652,7 +807,13 @@ function App() {
     gpuLabel,
     benchmark,
     busy,
+    cacheBusy,
     logs,
+    modelCache,
+    downloadStatus,
+    hfModels,
+    hfModelQuery,
+    hfModelsBusy,
     providerForm,
     providerPresets,
     updateProvider,
@@ -666,12 +827,20 @@ function App() {
     onUnload: () => void handleUnload(),
     onOptimize: () => void handleOptimize(),
     onCancel: () => void handleCancel(),
+    onRefreshModels: () => void refreshModelCache(),
+    onDownloadModel: (modelId?: string) => void handleDownloadModel(modelId),
+    onCancelDownload: () => void handleCancelDownload(),
+    onDeleteCachedModel: (modelId: string) => void handleDeleteCachedModel(modelId),
+    onUseCachedModel: handleUseCachedModel,
+    onUseHfModel: handleUseHfModel,
+    onSearchHfModels: () => void refreshHfModels(),
+    setHfModelQuery,
   }
 
   return (
-    <div className="flex min-h-screen flex-col bg-[linear-gradient(180deg,oklch(0.97_0.006_247)_0%,var(--background)_12rem)] text-foreground">
-      <header className="sticky top-0 z-20 shrink-0 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
-        <div className="mx-auto flex w-full max-w-[1500px] flex-col gap-3 px-3 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-4">
+    <div className="flex h-dvh min-h-0 flex-col overflow-hidden bg-background text-foreground">
+      <header className="z-20 shrink-0 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
+        <div className="flex w-full flex-col gap-2 px-3 py-2 sm:flex-row sm:items-center sm:justify-between sm:px-4">
           <div className="flex min-w-0 items-center gap-3">
             <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-sm sm:size-10">
               <Bot className="size-5" />
@@ -704,13 +873,13 @@ function App() {
         </div>
       </header>
 
-      <main className="mx-auto grid w-full max-w-[1500px] flex-1 grid-cols-1 gap-4 p-3 sm:p-4 xl:grid-cols-[400px_minmax(0,1fr)] xl:items-start">
-        <div className="hidden min-w-0 xl:block xl:sticky xl:top-[57px] xl:max-h-[calc(100vh-3.75rem)] xl:overflow-y-auto xl:pr-1">
+      <main className="grid min-h-0 w-full flex-1 grid-cols-1 gap-3 overflow-hidden p-3 xl:grid-cols-[380px_minmax(0,1fr)]">
+        <div className="hidden min-h-0 min-w-0 overflow-y-auto pr-1 xl:block">
           <ConfigPanel {...configPanelProps} layout="sidebar" />
         </div>
 
-        <Tabs defaultValue="chat" className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <TabsList className="sticky top-[57px] z-10 mb-3 grid h-auto w-full shrink-0 grid-cols-3 gap-1 rounded-xl border bg-background/95 p-1 shadow-sm backdrop-blur supports-[backdrop-filter]:bg-background/80 xl:static xl:top-auto xl:w-full xl:bg-muted">
+        <Tabs defaultValue="chat" className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
+          <TabsList className="mb-3 grid h-auto w-full shrink-0 grid-cols-3 gap-1 rounded-lg border bg-muted p-1 shadow-sm">
             <TabsTrigger className="h-10 w-full justify-center gap-2 rounded-lg px-3" value="chat">
               <MessageSquare className="size-4 shrink-0" />
               Chat
@@ -726,11 +895,11 @@ function App() {
           </TabsList>
 
           <TabsContent value="chat" className="mt-0 flex min-h-0 flex-1 flex-col data-[state=inactive]:hidden">
-            <Card className="flex min-h-[calc(100dvh-11rem)] flex-1 flex-col overflow-hidden shadow-sm xl:min-h-[calc(100vh-9.5rem)]">
+            <Card className="flex min-h-0 flex-1 flex-col overflow-hidden shadow-sm">
               <CardHeader className="shrink-0 border-b bg-muted/20 py-3">
                 <div className="flex items-start justify-between gap-3">
                   <div>
-                    <CardTitle>ChatUI</CardTitle>
+                    <CardTitle>Beszelgetes</CardTitle>
                     <CardDescription className="mt-1">
                       A betoltott lokalis modell valaszol a beszelgetesben
                     </CardDescription>
@@ -752,10 +921,10 @@ function App() {
                     <ChatEmptyState />
                   )}
                 </div>
-                <div className="shrink-0 border-t bg-background/95 p-4 pb-[max(1rem,env(safe-area-inset-bottom))] backdrop-blur">
-                  <div className="grid gap-3">
+                <div className="shrink-0 border-t bg-background/95 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur">
+                  <div className="grid gap-2">
                     <Textarea
-                      className="min-h-[88px] resize-none bg-background text-[15px] leading-relaxed"
+                      className="min-h-20 resize-none bg-background text-[15px] leading-relaxed"
                       placeholder="Uzenet... (Ctrl+Enter a kuldeshez)"
                       value={chatInput}
                       onChange={(event) => setChatInput(event.target.value)}
@@ -791,8 +960,8 @@ function App() {
             </Card>
           </TabsContent>
 
-          <TabsContent value="agent" className="mt-0 grid gap-4">
-            <Card>
+          <TabsContent value="agent" className="mt-0 grid min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] gap-3 overflow-hidden data-[state=inactive]:hidden">
+            <Card className="shrink-0">
               <CardHeader>
                 <CardTitle>Coding Agent</CardTitle>
                 <CardDescription>Egy gombbal indithato lokalis kodos asszisztens</CardDescription>
@@ -834,7 +1003,7 @@ function App() {
               </CardContent>
             </Card>
 
-            <Card>
+            <Card className="flex min-h-0 flex-col overflow-hidden">
               <CardHeader>
                 <CardTitle>Agent valasz</CardTitle>
                 <CardDescription>
@@ -843,8 +1012,8 @@ function App() {
                     : "A coding agent eredmenye itt jelenik meg"}
                 </CardDescription>
               </CardHeader>
-              <CardContent className="grid gap-4">
-                <div className="max-h-[60vh] min-h-[40vh] whitespace-pre-wrap break-words rounded-lg border bg-slate-950 p-3 text-sm leading-relaxed text-slate-50 sm:min-h-96 sm:max-h-none sm:p-4 sm:text-[15px]">
+              <CardContent className="flex min-h-0 flex-1 flex-col gap-4">
+                <div className="min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap break-words rounded-lg border bg-slate-950 p-3 text-sm leading-relaxed text-slate-50 sm:p-4 sm:text-[15px]">
                   {agentOutput?.text ?? ""}
                 </div>
                 {agentOutput && (
@@ -866,15 +1035,15 @@ function App() {
             </Card>
           </TabsContent>
 
-          <TabsContent value="generate" className="mt-0 grid gap-4">
-            <Card>
+          <TabsContent value="generate" className="mt-0 grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(0,0.95fr)_minmax(0,1.05fr)] gap-3 overflow-hidden data-[state=inactive]:hidden lg:grid-cols-[minmax(340px,0.85fr)_minmax(0,1.15fr)] lg:grid-rows-1">
+            <Card className="flex min-h-0 flex-col overflow-hidden">
               <CardHeader>
                 <CardTitle>Prompt</CardTitle>
                 <CardDescription>Egyszeri inference es sampling kontrollok</CardDescription>
               </CardHeader>
-              <CardContent className="grid gap-4">
+              <CardContent className="grid min-h-0 flex-1 gap-4 overflow-y-auto">
                 <Textarea
-                  className="min-h-48 resize-y text-base leading-relaxed"
+                  className="min-h-48 resize-y text-base leading-relaxed lg:min-h-64"
                   value={generateForm.prompt}
                   onChange={(event) => updateGenerate("prompt", event.target.value)}
                 />
@@ -895,7 +1064,7 @@ function App() {
               </CardContent>
             </Card>
 
-            <Card>
+            <Card className="flex min-h-0 flex-col overflow-hidden">
               <CardHeader>
                 <CardTitle>Kimenet</CardTitle>
                 <CardDescription>
@@ -904,8 +1073,8 @@ function App() {
                     : "A valasz itt jelenik meg"}
                 </CardDescription>
               </CardHeader>
-              <CardContent>
-                <div className="max-h-[60vh] min-h-[40vh] whitespace-pre-wrap break-words rounded-lg border bg-slate-950 p-3 text-sm leading-relaxed text-slate-50 sm:min-h-80 sm:max-h-none sm:p-4 sm:text-[15px]">
+              <CardContent className="flex min-h-0 flex-1">
+                <div className="min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap break-words rounded-lg border bg-slate-950 p-3 text-sm leading-relaxed text-slate-50 sm:p-4 sm:text-[15px]">
                   {output}
                 </div>
               </CardContent>

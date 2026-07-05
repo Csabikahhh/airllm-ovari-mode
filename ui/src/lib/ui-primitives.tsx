@@ -79,7 +79,7 @@ export function Metric({
 }) {
   if (loading) {
     return (
-      <div className="flex min-h-20 gap-3 rounded-lg border bg-muted/35 p-3 animate-pulse">
+      <div data-slot="metric" className="flex min-h-16 w-full gap-3 rounded-lg border bg-muted/35 p-3 animate-pulse">
         <div className="mt-0.5 size-8 shrink-0 rounded-md bg-muted" />
         <div className="min-w-0 flex-1 space-y-2">
           <div className="h-3 w-16 rounded bg-muted" />
@@ -91,8 +91,9 @@ export function Metric({
 
   return (
     <div
+      data-slot="metric"
       className={cn(
-        "flex min-h-20 gap-3 rounded-lg border bg-muted/35 p-3",
+        "flex min-h-16 w-full gap-3 overflow-hidden rounded-lg border bg-muted/35 p-3",
         tone === "good" && "border-emerald-200 bg-emerald-50",
         tone === "warn" && "border-amber-200 bg-amber-50",
       )}
@@ -100,7 +101,7 @@ export function Metric({
       <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-md bg-background text-muted-foreground">
         {icon}
       </div>
-      <div className="min-w-0">
+      <div className="min-w-0 flex-1">
         <p className="text-xs font-medium text-muted-foreground">{label}</p>
         <div className="mt-1 break-words text-sm font-semibold leading-snug">{value}</div>
       </div>

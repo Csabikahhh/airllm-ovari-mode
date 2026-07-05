@@ -60,6 +60,16 @@ prefetched CPU tensors correctly, and uses Transformers `DynamicCache` for
 modern rotary decoder models when `KV cache` is enabled. Unsupported or batched
 cache cases fall back to cache-free inference.
 
+The `CPU+GPU hybrid` runtime mode uses Transformers/Accelerate `device_map="auto"`
+on CUDA systems to split model layers across VRAM and system RAM. It can run
+larger models than a fully resident GPU load, but is usually slower than a model
+that fits completely on the GPU.
+
+On macOS Apple Silicon, the UI detects PyTorch Metal/MPS and uses `mps` as the
+recommended local device. The upstream AirLLM MLX fallback is optional; install
+`mlx` in the virtual environment if you want to use that path for supported
+Llama-style models.
+
 The first model load can take a long time because AirLLM downloads and splits
 model layers into the Hugging Face cache. For best results on a laptop/desktop
 with NVMe storage, place `HF_HOME` or `Layer cache` on the fastest SSD with
@@ -82,6 +92,32 @@ It reads the project tree, `git status --short`, and a small set of important
 files, then asks the local model for a coding-agent style answer. It does not
 run shell commands or write files automatically; it returns a plan, proposed
 changes, and test suggestions for review.
+
+### Terminal / CMD client
+
+Keep the AirLLM backend running, then call the same agent from a terminal:
+
+```powershell
+.\airllm.cmd status
+.\airllm.cmd models
+.\airllm.cmd hf-search "Qwen2.5 Coder"
+.\airllm.cmd agent "Nezd at a projektet es javasolj performance javitasokat" --workspace .
+```
+
+If no model is loaded in the UI, pass a model ID and the CLI will ask the backend
+to autoload it:
+
+```powershell
+.\airllm.cmd agent "Keress security hibakat" --model Qwen/Qwen2.5-Coder-3B-Instruct
+```
+
+You can also use the generic Python client directly:
+
+```powershell
+.\.venv\Scripts\python.exe airllm_cli.py download Qwen/Qwen2.5-Coder-3B-Instruct
+.\.venv\Scripts\python.exe airllm_cli.py download-status
+.\.venv\Scripts\python.exe airllm_cli.py cancel-download
+```
 
 ## Benchmark and Stop
 

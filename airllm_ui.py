@@ -29,7 +29,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -190,6 +190,24 @@ MODEL_STATE: Dict[str, Any] = {
     "load_seconds": None,
 }
 GENERATION_CANCEL = threading.Event()
+DOWNLOAD_LOCK = threading.RLock()
+DOWNLOAD_CANCEL = threading.Event()
+DOWNLOAD_THREAD: Optional[threading.Thread] = None
+DOWNLOAD_STATE: Dict[str, Any] = {
+    "active": False,
+    "status": "idle",
+    "model_id": None,
+    "path": None,
+    "current_file": None,
+    "total_bytes": 0,
+    "downloaded_bytes": 0,
+    "files_total": 0,
+    "files_cached": 0,
+    "files_to_download": 0,
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+}
 
 AGENT_EXCLUDED_DIRS = {
     ".git",
@@ -386,6 +404,56 @@ def get_cuda_info() -> Dict[str, Any]:
     return {"available": available, "error": None, "devices": devices}
 
 
+def mps_available(torch: Any) -> bool:
+    try:
+        return bool(
+            torch is not None
+            and hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_available()
+        )
+    except Exception:
+        return False
+
+
+def get_mps_info() -> Dict[str, Any]:
+    torch, torch_error = get_torch()
+    if torch is None:
+        return {"available": False, "built": False, "error": torch_error}
+
+    try:
+        built = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_built())
+        available = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+        return {"available": available, "built": built, "error": None}
+    except Exception as exc:
+        return {"available": False, "built": False, "error": str(exc)}
+
+
+def get_mlx_info() -> Dict[str, Any]:
+    if platform.system().lower() != "darwin":
+        return {"available": False, "version": None, "error": None}
+    try:
+        import mlx.core as mx  # type: ignore
+
+        return {"available": True, "version": getattr(mx, "__version__", None), "error": None}
+    except Exception as exc:
+        return {"available": False, "version": None, "error": str(exc)}
+
+
+def available_device_options() -> list[str]:
+    torch, _ = get_torch()
+    devices = ["auto", "cpu"]
+    if torch is not None:
+        try:
+            if torch.cuda.is_available():
+                devices.insert(1, "cuda:0")
+        except Exception:
+            pass
+        if mps_available(torch):
+            insert_at = 1 if "cuda:0" not in devices else 2
+            devices.insert(insert_at, "mps")
+    return devices
+
+
 def hardware_profile() -> Dict[str, Any]:
     torch, torch_error = get_torch()
     return {
@@ -400,6 +468,8 @@ def hardware_profile() -> Dict[str, Any]:
         "power": get_power_info(),
         "network": get_network_info(),
         "cuda": get_cuda_info(),
+        "mps": get_mps_info(),
+        "mlx": get_mlx_info(),
         "torch": {
             "available": torch is not None,
             "version": getattr(torch, "__version__", None) if torch is not None else None,
@@ -407,6 +477,7 @@ def hardware_profile() -> Dict[str, Any]:
         },
         "bitsandbytes": {"available": import_bitsandbytes_ok()},
         "supported_families": SUPPORTED_FAMILIES,
+        "device_options": available_device_options(),
         "recommendation": recommended_settings(),
     }
 
@@ -427,6 +498,7 @@ def recommended_settings() -> Dict[str, Any]:
 def _compute_recommended_settings() -> Dict[str, Any]:
     torch, _ = get_torch()
     cuda_available = bool(torch is not None and torch.cuda.is_available())
+    mps_is_available = mps_available(torch)
     bnb_available = import_bitsandbytes_ok()
     vram_gb = 0.0
 
@@ -434,6 +506,32 @@ def _compute_recommended_settings() -> Dict[str, Any]:
         for index in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(index)
             vram_gb = max(vram_gb, props.total_memory / 1024 / 1024 / 1024)
+
+    if mps_is_available and not cuda_available:
+        memory = get_memory_info()
+        total_ram = float(memory.get("total_gb") or 0.0)
+        max_seq_len = 512
+        max_new_tokens = 96
+        if total_ram >= 16:
+            max_seq_len = 1024
+            max_new_tokens = 128
+        if total_ram >= 32:
+            max_seq_len = 2048
+            max_new_tokens = 192
+        if total_ram >= 64:
+            max_seq_len = 4096
+            max_new_tokens = 256
+        return {
+            "device": "mps",
+            "dtype": "float16",
+            "compression": "none",
+            "prefetching": False,
+            "cleanup_interval": 4,
+            "prefetch_workers": 1,
+            "reinitialize_model_each_forward": False,
+            "max_seq_len": max_seq_len,
+            "max_new_tokens": max_new_tokens,
+        }
 
     if not cuda_available:
         return {
@@ -559,7 +657,24 @@ def run_local_benchmark(payload: Optional[Dict[str, Any]] = None) -> Dict[str, A
                 torch.cuda.synchronize()
                 result["gpu_matmul_ms"] = round((time.perf_counter() - start) * 1000 / 5, 2)
                 del a, b
-                torch.cuda.empty_cache()
+                empty_accelerator_cache(torch)
+            elif mps_available(torch):
+                device = "mps"
+                dtype = torch.float16
+                size = 1024
+                a = torch.randn((size, size), device=device, dtype=dtype)
+                b = torch.randn((size, size), device=device, dtype=dtype)
+                torch.mps.synchronize()
+                for _ in range(2):
+                    _ = a @ b
+                torch.mps.synchronize()
+                start = time.perf_counter()
+                for _ in range(5):
+                    _ = a @ b
+                torch.mps.synchronize()
+                result["gpu_matmul_ms"] = round((time.perf_counter() - start) * 1000 / 5, 2)
+                del a, b
+                empty_accelerator_cache(torch)
 
             size = 768
             a = torch.randn((size, size), dtype=torch.float32)
@@ -648,6 +763,10 @@ def resolve_device(value: str) -> str:
         return recommendation["device"]
     if requested.startswith("cuda") and not (torch is not None and torch.cuda.is_available()):
         raise RuntimeError("CUDA nem elerheto ebben a Python kornyezetben.")
+    if requested == "mps" and not mps_available(torch):
+        raise RuntimeError("Apple Metal/MPS nem elerheto ebben a Python kornyezetben.")
+    if requested not in {"cpu", "mps"} and not requested.startswith("cuda"):
+        raise ValueError(f"Ismeretlen device: {requested}")
     return requested
 
 
@@ -663,6 +782,8 @@ def resolve_dtype(value: str, device: str) -> Any:
                 requested = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
             except Exception:
                 requested = "float16"
+        elif device == "mps":
+            requested = "float16"
         else:
             requested = "float32"
 
@@ -714,6 +835,20 @@ def current_status() -> Dict[str, Any]:
     }
 
 
+def empty_accelerator_cache(torch: Any) -> None:
+    if torch is None:
+        return
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        if hasattr(torch, "mps"):
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
 def selected_provider(payload: Dict[str, Any]) -> str:
     provider = str(payload.get("provider") or "local").strip().lower()
     if provider in {"", "airllm"}:
@@ -752,16 +887,415 @@ def unload_model() -> Dict[str, Any]:
     gc.collect()
     torch, _ = get_torch()
     if torch is not None:
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
+        empty_accelerator_cache(torch)
     return current_status()
 
 
 def cancel_generation() -> Dict[str, Any]:
     GENERATION_CANCEL.set()
     return {"cancel_requested": True}
+
+
+def bytes_to_gb(value: int) -> float:
+    return round(value / 1024 / 1024 / 1024, 2)
+
+
+def hf_hub_cache_dir() -> Path:
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        return Path(HF_HUB_CACHE).resolve()
+    except Exception:
+        hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+        return (hf_home / "hub").resolve()
+
+
+def cache_dir_for_model_id(model_id: str) -> Path:
+    cleaned = model_id.strip()
+    if not cleaned or cleaned.startswith(("/", "\\")) or ":" in cleaned or "\\" in cleaned:
+        raise ValueError("Csak Hugging Face model ID torolheto a cache-bol.")
+    if Path(cleaned).exists():
+        raise ValueError("Helyi modell utvonal torlese UI-bol nincs engedelyezve.")
+
+    cache_root = hf_hub_cache_dir()
+    candidate = (cache_root / ("models--" + cleaned.replace("/", "--"))).resolve()
+    if cache_root != candidate and cache_root not in candidate.parents:
+        raise ValueError("A cel kikerulne a Hugging Face cache konyvtarbol.")
+    return candidate
+
+
+def directory_stats(path: Path) -> Tuple[int, Optional[float]]:
+    total = 0
+    latest: Optional[float] = None
+    seen: set[Any] = set()
+
+    def walk(directory: Path) -> None:
+        nonlocal total, latest
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            return
+        for entry in entries:
+            try:
+                stat = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            latest = stat.st_mtime if latest is None else max(latest, stat.st_mtime)
+            if entry.is_dir(follow_symlinks=False):
+                walk(Path(entry.path))
+            elif entry.is_file(follow_symlinks=False):
+                key = (stat.st_dev, stat.st_ino) if stat.st_ino else str(Path(entry.path).resolve())
+                if key not in seen:
+                    seen.add(key)
+                    total += stat.st_size
+
+    walk(path)
+    return total, latest
+
+
+def list_cached_models() -> Dict[str, Any]:
+    cache_dir = hf_hub_cache_dir()
+    models = []
+    total_size = 0
+    if cache_dir.exists():
+        for child in cache_dir.iterdir():
+            if not child.is_dir() or not child.name.startswith("models--"):
+                continue
+            model_id = child.name[len("models--") :].replace("--", "/")
+            size_bytes, modified_at = directory_stats(child)
+            snapshots_dir = child / "snapshots"
+            snapshots = []
+            if snapshots_dir.exists():
+                try:
+                    snapshots = [item.name for item in snapshots_dir.iterdir() if item.is_dir()]
+                except OSError:
+                    snapshots = []
+            total_size += size_bytes
+            models.append(
+                {
+                    "model_id": model_id,
+                    "path": str(child),
+                    "size_bytes": size_bytes,
+                    "size_gb": bytes_to_gb(size_bytes),
+                    "modified_at": modified_at,
+                    "snapshots": len(snapshots),
+                }
+            )
+
+    models.sort(key=lambda item: item.get("modified_at") or 0, reverse=True)
+    return {
+        "cache_dir": str(cache_dir),
+        "models": models,
+        "total_size_bytes": total_size,
+        "total_size_gb": bytes_to_gb(total_size),
+        "download": download_status(),
+    }
+
+
+def _model_datetime(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return value.isoformat()
+    except Exception:
+        return str(value)
+
+
+def _hf_model_to_dict(model: Any) -> Dict[str, Any]:
+    model_id = getattr(model, "id", None) or getattr(model, "modelId", None) or ""
+    tags = getattr(model, "tags", None) or []
+    if not isinstance(tags, list):
+        tags = list(tags)
+    return {
+        "model_id": model_id,
+        "downloads": getattr(model, "downloads", None),
+        "likes": getattr(model, "likes", None),
+        "pipeline_tag": getattr(model, "pipeline_tag", None),
+        "library_name": getattr(model, "library_name", None),
+        "private": bool(getattr(model, "private", False)),
+        "gated": getattr(model, "gated", None),
+        "tags": [str(tag) for tag in tags[:12]],
+        "last_modified": _model_datetime(getattr(model, "last_modified", None)),
+    }
+
+
+def list_huggingface_models(params: Dict[str, Any]) -> Dict[str, Any]:
+    query = str(params.get("q") or params.get("query") or "Qwen2.5 Instruct").strip()
+    if len(query) > 120:
+        query = query[:120]
+    limit = parse_int(params.get("limit"), 20, 1, 50)
+    task = str(params.get("task") or "text-generation").strip() or None
+
+    token = (
+        params.get("hf_token")
+        or os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or ""
+    )
+    token = str(token).strip() or None
+
+    import inspect
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=token)
+    supported = inspect.signature(api.list_models).parameters
+    kwargs: Dict[str, Any] = {}
+    if "search" in supported:
+        kwargs["search"] = query or None
+    if "pipeline_tag" in supported:
+        kwargs["pipeline_tag"] = task
+    elif "task" in supported:
+        kwargs["task"] = task
+    if "sort" in supported:
+        kwargs["sort"] = "downloads"
+    if "direction" in supported:
+        kwargs["direction"] = -1
+    if "limit" in supported:
+        kwargs["limit"] = limit
+    if "full" in supported:
+        kwargs["full"] = False
+    if "gated" in supported:
+        kwargs["gated"] = False
+    if "token" in supported:
+        kwargs["token"] = token
+
+    models_iter = api.list_models(**kwargs)
+    models = [_hf_model_to_dict(model) for model in models_iter]
+    models = [model for model in models if model.get("model_id")]
+    return {
+        "query": query,
+        "task": task,
+        "limit": limit,
+        "models": models,
+    }
+
+
+def delete_cached_model(payload: Dict[str, Any]) -> Dict[str, Any]:
+    model_id = str(payload.get("model_id") or "").strip()
+    if not model_id:
+        raise ValueError("Add meg a torlendo model ID-t.")
+
+    target = cache_dir_for_model_id(model_id)
+    if not target.exists():
+        result = list_cached_models()
+        result["deleted"] = False
+        result["message"] = "A modell nincs a Hugging Face cache-ben."
+        return result
+
+    loaded_model = (MODEL_STATE.get("config") or {}).get("model_id")
+    if loaded_model == model_id:
+        if parse_bool(payload.get("unload_if_loaded"), True):
+            unload_model()
+        else:
+            raise ValueError("A modell jelenleg be van toltve. Elobb uritsd ki.")
+
+    size_bytes, _ = directory_stats(target)
+    shutil.rmtree(target)
+    result = list_cached_models()
+    result["deleted"] = True
+    result["deleted_model_id"] = model_id
+    result["deleted_bytes"] = size_bytes
+    result["deleted_gb"] = bytes_to_gb(size_bytes)
+    return result
+
+
+def _download_state_snapshot() -> Dict[str, Any]:
+    with DOWNLOAD_LOCK:
+        state = dict(DOWNLOAD_STATE)
+
+    now = time.time()
+    started_at = state.get("started_at")
+    finished_at = state.get("finished_at")
+    if started_at:
+        elapsed = (finished_at or now) - started_at
+    else:
+        elapsed = 0.0
+
+    downloaded = int(state.get("downloaded_bytes") or 0)
+    total = int(state.get("total_bytes") or 0)
+    percent = None
+    eta = None
+    if total > 0:
+        percent = round(min(100.0, downloaded / total * 100), 1)
+        if state.get("active") and downloaded > 0 and downloaded < total and elapsed > 0:
+            rate = downloaded / elapsed
+            if rate > 0:
+                eta = round((total - downloaded) / rate)
+    elif state.get("status") in {"cached", "done"}:
+        percent = 100.0
+
+    state["elapsed_seconds"] = round(elapsed)
+    state["eta_seconds"] = eta
+    state["percent"] = percent
+    state["downloaded_gb"] = bytes_to_gb(downloaded)
+    state["total_gb"] = bytes_to_gb(total)
+    return state
+
+
+def download_status() -> Dict[str, Any]:
+    return _download_state_snapshot()
+
+
+def _update_download_state(**updates: Any) -> None:
+    with DOWNLOAD_LOCK:
+        DOWNLOAD_STATE.update(updates)
+
+
+class DownloadCancelled(RuntimeError):
+    pass
+
+
+def _raise_if_download_cancelled() -> None:
+    if DOWNLOAD_CANCEL.is_set():
+        raise DownloadCancelled("A modell letoltese megszakitva.")
+
+
+def _add_download_bytes(value: int) -> None:
+    if value <= 0:
+        return
+    with DOWNLOAD_LOCK:
+        total = int(DOWNLOAD_STATE.get("total_bytes") or 0)
+        current = int(DOWNLOAD_STATE.get("downloaded_bytes") or 0) + value
+        DOWNLOAD_STATE["downloaded_bytes"] = min(current, total) if total > 0 else current
+
+
+def _download_tqdm_class() -> Any:
+    from tqdm.auto import tqdm
+
+    class DownloadProgressBar(tqdm):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            _raise_if_download_cancelled()
+            desc = kwargs.get("desc")
+            if desc:
+                _update_download_state(current_file=str(desc))
+            super().__init__(*args, **kwargs)
+
+        def update(self, n: int = 1) -> Any:
+            _raise_if_download_cancelled()
+            _add_download_bytes(int(n or 0))
+            result = super().update(n)
+            _raise_if_download_cancelled()
+            return result
+
+        def close(self) -> None:
+            _update_download_state(current_file=None)
+            super().close()
+
+    return DownloadProgressBar
+
+
+def start_model_download(payload: Dict[str, Any]) -> Dict[str, Any]:
+    global DOWNLOAD_THREAD
+
+    model_id = str(payload.get("model_id") or "").strip()
+    if not model_id:
+        raise ValueError("Add meg a letoltendo model ID-t.")
+    cache_dir_for_model_id(model_id)
+
+    hf_token = (
+        payload.get("hf_token")
+        or os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or ""
+    )
+    hf_token = str(hf_token).strip() or None
+    max_workers = parse_int(payload.get("download_workers"), 4, 1, 8)
+
+    with DOWNLOAD_LOCK:
+        if DOWNLOAD_STATE.get("active"):
+            raise ValueError("Mar fut egy modell letoltes.")
+        DOWNLOAD_CANCEL.clear()
+        DOWNLOAD_STATE.update(
+            {
+                "active": True,
+                "status": "preparing",
+                "model_id": model_id,
+                "path": None,
+                "current_file": None,
+                "total_bytes": 0,
+                "downloaded_bytes": 0,
+                "files_total": 0,
+                "files_cached": 0,
+                "files_to_download": 0,
+                "started_at": time.time(),
+                "finished_at": None,
+                "error": None,
+            }
+        )
+
+    def worker() -> None:
+        try:
+            from huggingface_hub import snapshot_download
+
+            _raise_if_download_cancelled()
+            _update_download_state(status="preparing")
+            dry_run = snapshot_download(model_id, token=hf_token, dry_run=True)
+            _raise_if_download_cancelled()
+            files_total = len(dry_run)
+            files_to_download = [item for item in dry_run if getattr(item, "will_download", False)]
+            files_cached = files_total - len(files_to_download)
+            total_bytes = sum(int(getattr(item, "file_size", 0) or 0) for item in files_to_download)
+            _update_download_state(
+                status="cached" if total_bytes <= 0 else "downloading",
+                total_bytes=total_bytes,
+                files_total=files_total,
+                files_cached=files_cached,
+                files_to_download=len(files_to_download),
+            )
+
+            path = snapshot_download(
+                model_id,
+                token=hf_token,
+                max_workers=max_workers,
+                tqdm_class=_download_tqdm_class(),
+            )
+            _raise_if_download_cancelled()
+            with DOWNLOAD_LOCK:
+                if total_bytes > 0:
+                    DOWNLOAD_STATE["downloaded_bytes"] = total_bytes
+                DOWNLOAD_STATE.update(
+                    {
+                        "active": False,
+                        "status": "done",
+                        "path": path,
+                        "current_file": None,
+                        "finished_at": time.time(),
+                    }
+                )
+        except DownloadCancelled as exc:
+            _update_download_state(
+                active=False,
+                status="cancelled",
+                error=str(exc),
+                current_file=None,
+                finished_at=time.time(),
+            )
+        except Exception as exc:
+            _update_download_state(
+                active=False,
+                status="error",
+                error=f"{type(exc).__name__}: {exc}",
+                current_file=None,
+                finished_at=time.time(),
+            )
+
+    DOWNLOAD_THREAD = threading.Thread(target=worker, daemon=True)
+    DOWNLOAD_THREAD.start()
+    return download_status()
+
+
+def cancel_model_download() -> Dict[str, Any]:
+    with DOWNLOAD_LOCK:
+        if not DOWNLOAD_STATE.get("active"):
+            return download_status()
+        DOWNLOAD_CANCEL.set()
+        DOWNLOAD_STATE.update(
+            {
+                "status": "cancelling",
+                "error": None,
+            }
+        )
+    return download_status()
 
 
 def normalized_load_config(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -771,7 +1305,18 @@ def normalized_load_config(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     device = resolve_device(payload.get("device", "auto"))
     dtype_name = (payload.get("dtype") or "auto").strip()
-    compression = resolve_compression(payload.get("compression", "auto"), device)
+    load_mode = str(payload.get("load_mode") or "auto").strip().lower()
+    if load_mode not in {"auto", "airllm", "direct", "hybrid"}:
+        load_mode = "auto"
+    if load_mode == "hybrid" and not device.startswith("cuda"):
+        raise RuntimeError("A CPU+GPU hybrid mod jelenleg CUDA/NVIDIA device mellett tamogatott.")
+
+    compression_value = payload.get("compression", "auto")
+    if load_mode == "hybrid" and str(compression_value).strip().lower() == "auto":
+        compression_value = "none"
+    compression = resolve_compression(compression_value, device)
+    if load_mode == "hybrid" and compression is not None:
+        raise RuntimeError("A CPU+GPU hybrid modot compression nelkul hasznald.")
     max_seq_len = parse_int(payload.get("max_seq_len"), recommended_settings()["max_seq_len"], 128, 32768)
 
     prefetch_value = (payload.get("prefetching") or "auto")
@@ -796,10 +1341,6 @@ def normalized_load_config(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     layer_path = (payload.get("layer_shards_saving_path") or "").strip() or None
     hf_token = (payload.get("hf_token") or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip() or None
-
-    load_mode = str(payload.get("load_mode") or "auto").strip().lower()
-    if load_mode not in {"auto", "airllm", "direct"}:
-        load_mode = "auto"
 
     return {
         "model_id": model_id,
@@ -858,6 +1399,13 @@ def free_vram_gb(device: str) -> Optional[float]:
     torch, _ = get_torch()
     if torch is None:
         return None
+    if device == "mps":
+        available = get_memory_info().get("available_gb")
+        if available is None:
+            return None
+        # Apple Silicon uses unified memory. Keep a conservative OS/app reserve so a
+        # resident load does not pressure the whole desktop session.
+        return max(0.0, float(available) - 4.0)
     try:
         return torch.cuda.mem_get_info(device)[0] / (1024 ** 3)
     except Exception:
@@ -889,7 +1437,7 @@ def plan_load_strategy(config: Dict[str, Any], dtype: Any) -> Tuple[str, Dict[st
 
     Returns (strategy, info) where strategy is one of:
       - "airllm":         existing layer-by-layer disk streaming (default/fallback)
-      - "direct_gpu":     plain transformers model fully resident on the GPU
+      - "direct_gpu":     plain transformers model fully resident on CUDA/MPS
       - "direct_offload": plain transformers model with accelerate CPU/disk offload
     """
     torch, _ = get_torch()
@@ -900,9 +1448,24 @@ def plan_load_strategy(config: Dict[str, Any], dtype: Any) -> Tuple[str, Dict[st
     if requested == "airllm":
         info["reason"] = "explicit airllm"
         return "airllm", info
-    # Direct load only makes sense on CUDA, without AirLLM-only compression.
-    if torch is None or not str(device).startswith("cuda") or config.get("compression") is not None:
-        info["reason"] = "no cuda / compression set"
+    if requested == "hybrid":
+        if torch is None or not str(device).startswith("cuda") or config.get("compression") is not None:
+            info["reason"] = "hybrid requires CUDA without AirLLM compression"
+            return "airllm", info
+        vram = free_vram_gb(device)
+        ram = get_memory_info().get("available_gb")
+        info.update(
+            {
+                "free_accelerator_gb": round(vram, 2) if vram else None,
+                "free_ram_gb": ram,
+            }
+        )
+        info["reason"] = "explicit CPU+GPU hybrid"
+        return "direct_offload", info
+    accelerator = str(device).startswith("cuda") or str(device) == "mps"
+    # Direct load only makes sense on a Torch accelerator, without AirLLM-only compression.
+    if torch is None or not accelerator or config.get("compression") is not None:
+        info["reason"] = "no supported accelerator / compression set"
         return "airllm", info
 
     bytes_pp = 2 if dtype in (torch.float16, torch.bfloat16) else 4
@@ -934,32 +1497,37 @@ def plan_load_strategy(config: Dict[str, Any], dtype: Any) -> Tuple[str, Dict[st
             est_q = est_q * (bits / 16.0)  # weights shrink ~bits/16 vs bf16 (rough; embeds excluded)
         vram_q = free_vram_gb(device)
         info.update({"quant_bits": bits, "est_gb": round(est_q, 2) if est_q else None,
-                     "free_vram_gb": round(vram_q, 2) if vram_q else None})
+                     "free_accelerator_gb": round(vram_q, 2) if vram_q else None})
         if est_q is not None and vram_q is not None and est_q <= max(0.0, vram_q - 1.0):
-            info["reason"] = f"prequantized {bits}bit fits VRAM -> direct_gpu"
+            info["reason"] = f"prequantized {bits}bit fits accelerator memory -> direct_gpu"
             return "direct_gpu", info
-        info["reason"] = "prequantized too large for VRAM -> airllm"
+        info["reason"] = "prequantized too large for accelerator memory -> airllm"
         return "airllm", info
 
     est_gb = estimate_model_weight_gb(hf_config, bytes_pp)
     vram = free_vram_gb(device)
     ram = get_memory_info().get("available_gb")
     info.update({"est_gb": round(est_gb, 2) if est_gb else None,
-                 "free_vram_gb": round(vram, 2) if vram else None,
+                 "free_accelerator_gb": round(vram, 2) if vram else None,
                  "free_ram_gb": ram})
 
-    # GPU budget: reserve ~1 GB of CURRENTLY-FREE VRAM for the CUDA context, KV cache and
-    # activation peak. If the estimate is slightly off and the load OOMs, load_model() has
-    # a guarded fallback to AirLLM streaming, so a modest reserve is safe.
+    # Accelerator budget: reserve ~1 GB for the runtime context, KV cache and activation
+    # peak. On MPS free_vram_gb() already subtracts a larger unified-memory OS reserve.
     if est_gb is not None and vram is not None and est_gb <= max(0.0, vram - 1.0):
-        info["reason"] = "fits VRAM"
+        info["reason"] = "fits accelerator memory"
         return "direct_gpu", info
     # CPU/disk offload is far faster than AirLLM disk streaming, but only auto-pick it
-    # when the user explicitly asked for "direct" (it can still be slow / thrash).
-    if requested == "direct" and est_gb is not None and ram is not None and est_gb <= max(0.0, ram - 2.0):
+    # when the user explicitly asked for "direct" on CUDA (it can still be slow / thrash).
+    if (
+        requested == "direct"
+        and str(device).startswith("cuda")
+        and est_gb is not None
+        and ram is not None
+        and est_gb <= max(0.0, ram - 2.0)
+    ):
         info["reason"] = "offload to RAM"
         return "direct_offload", info
-    info["reason"] = "too large -> airllm streaming"
+    info["reason"] = "too large -> airllm/mlx streaming"
     return "airllm", info
 
 
@@ -984,14 +1552,19 @@ def build_direct_model(config: Dict[str, Any], dtype: Any, strategy: str) -> Any
         common["max_memory"] = {0: f"{gpu_cap}GiB", "cpu": f"{cpu_cap}GiB"}
         common["offload_folder"] = os.path.join(tempfile.gettempdir(), "airllm_offload")
         common["low_cpu_mem_usage"] = True
-    else:  # direct_gpu
+    elif str(config["device"]).startswith("cuda"):  # direct_gpu on CUDA
         common["device_map"] = {"": config["device"]}
+    else:  # direct_gpu on MPS/Metal
+        common["low_cpu_mem_usage"] = True
 
     # Prefer the SDPA attention kernel; retry without it for models that reject the kwarg.
     try:
         model = AutoModelForCausalLM.from_pretrained(config["model_id"], attn_implementation="sdpa", **common)
     except (ValueError, TypeError):
         model = AutoModelForCausalLM.from_pretrained(config["model_id"], **common)
+
+    if strategy == "direct_gpu" and config["device"] == "mps":
+        model.to("mps")
 
     model.eval()
     tok_kwargs = {"trust_remote_code": True}
@@ -1022,10 +1595,7 @@ def load_model(payload: Dict[str, Any]) -> Dict[str, Any]:
         gc.collect()
         torch, _ = get_torch()
         if torch is not None:
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+            empty_accelerator_cache(torch)
 
         dtype = resolve_dtype(config["dtype"], config["device"])
 
@@ -1044,10 +1614,7 @@ def load_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                 model = None
                 gc.collect()
                 if torch is not None:
-                    try:
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
+                    empty_accelerator_cache(torch)
                 strategy = "airllm"
 
         if model is None:
@@ -1061,9 +1628,6 @@ def load_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "compression": config["compression"],
                 "profiling_mode": config["profiling_mode"],
                 "prefetching": config["prefetching"],
-                "cleanup_interval": config["cleanup_interval"],
-                "prefetch_workers": config["prefetch_workers"],
-                "reinitialize_model_each_forward": config["reinitialize_model_each_forward"],
                 "delete_original": config["delete_original"],
             }
             if config["layer_shards_saving_path"]:
@@ -1790,7 +2354,9 @@ class AirLLMHandler(BaseHTTPRequestHandler):
     disable_nagle_algorithm = True
 
     def do_GET(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
+        query = {key: values[-1] if values else "" for key, values in parse_qs(parsed_url.query).items()}
         try:
             if path.startswith("/api/"):
                 if path == "/api/hardware":
@@ -1801,6 +2367,12 @@ class AirLLMHandler(BaseHTTPRequestHandler):
                     json_response(self, {"providers": PROVIDER_PRESETS})
                 elif path == "/api/status":
                     json_response(self, current_status())
+                elif path == "/api/models":
+                    json_response(self, list_cached_models())
+                elif path == "/api/hf-models":
+                    json_response(self, list_huggingface_models(query))
+                elif path == "/api/download/status":
+                    json_response(self, download_status())
                 else:
                     json_response(self, {"error": "Not found"}, 404)
             elif try_static_response(self, path):
@@ -1839,6 +2411,12 @@ class AirLLMHandler(BaseHTTPRequestHandler):
                 json_response(self, apply_runtime_optimizations())
             elif path == "/api/benchmark":
                 json_response(self, run_local_benchmark(payload))
+            elif path == "/api/models/delete":
+                json_response(self, delete_cached_model(payload))
+            elif path == "/api/download":
+                json_response(self, start_model_download(payload))
+            elif path == "/api/download/cancel":
+                json_response(self, cancel_model_download())
             else:
                 json_response(self, {"error": "Not found"}, 404)
         except Exception as exc:
