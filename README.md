@@ -1,10 +1,12 @@
 ![airllm_logo](https://github.com/lyogavin/airllm/blob/main/assets/airllm_logo_sm.png?v=3&raw=true)
 
-[**Quickstart**](#quickstart) | 
+[**Quickstart**](#quickstart) |
+[**Fork Highlights**](#fork-highlights) |
 [**Local UI**](#local-ui-chat-and-coding-agent) |
-[**Configurations**](#configurations) | 
-[**MacOS**](#macos) | 
-[**Example notebooks**](#example-python-notebook) | 
+[**Configurations**](#configurations) |
+[**Supported Models**](#supported-models) |
+[**MacOS**](#macos) |
+[**Example notebooks**](#example-python-notebook) |
 [**FAQ**](#faq)
 
 **AirLLM** dramatically reduces inference memory usage, letting 70B large language models run on a single 4GB GPU card — without quantization, distillation, or pruning. You can even run **405B Llama 3.1** on **8GB**, and **DeepSeek-V3 (671B)** on **~12GB**.
@@ -23,6 +25,22 @@
 [![Support me on Patreon](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fshieldsio-patreon.vercel.app%2Fapi%3Fusername%3Dgavinli%26type%3Dpatrons&style=flat)](https://patreon.com/gavinli)
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/lyogavin?logo=GitHub&color=lightgray)](https://github.com/sponsors/lyogavin)
 
+## Fork Highlights
+
+This repository tracks upstream AirLLM and adds a local desktop-friendly app
+layer for running, testing, and chatting with large models from one workspace.
+
+* Local browser UI served by `airllm_ui.py`, with a React/Vite frontend in `ui/`.
+* Hardware-aware defaults for CUDA, CPU, Apple Metal/MPS, and CPU+GPU hybrid mode.
+* ChatUI for local AirLLM models or OpenAI-compatible external providers.
+* Review-only Coding Agent mode that reads workspace context and proposes changes
+  without automatically writing files.
+* Terminal helpers through `airllm.cmd`, `airllm-agent.cmd`, and `airllm_cli.py`.
+* Model search/download controls, download progress, cancellation, and local cache
+  inspection.
+* Runtime tuning for dtype, compression, prefetching, cleanup interval, sequence
+  length, layer cache path, and benchmark checks.
+
 ## AI Agents Recommendation:
 
 * [Best AI Game Sprite Generator](https://godmodeai.co)
@@ -32,6 +50,10 @@
 * [Bloome — build & run AI agent teams in the cloud, zero setup](https://bloome.im/login?ref=G6BYnov0)
 
 ## Updates
+[2026/07] Fork refreshed with upstream AirLLM v3 changes plus local UI, CLI,
+external-provider chat, model download controls, MPS detection, CPU+GPU hybrid
+mode, and coding-agent documentation.
+
 [2026/06] **v3.0**: FP8 model support + the latest models. Run **DeepSeek-V3 (671B) on ~12GB** and **Qwen3-235B on ~3GB**, plus Qwen3, Llama 3.x/4, DeepSeek V2/V3, Phi-4, Gemma and more — all through a single `AutoModel`.
 
 [2024/08/20] v2.11.0: Support Qwen2.5
@@ -70,6 +92,7 @@
 ## Table of Contents
 
 * [Quick start](#quickstart)
+* [Fork Highlights](#fork-highlights)
 * [Local UI, Chat and Coding Agent](#local-ui-chat-and-coding-agent)
 * [Model Compression](#model-compression---3x-inference-speed-up)
 * [Configurations](#configurations)
@@ -83,17 +106,26 @@
 
 ### 1. Install package
 
-First, install the airllm pip package.
+First, install the AirLLM pip package.
 
 ```bash
 pip install airllm
 ```
 
+When running this fork from source, use the project environment and install the
+checked-in dependency set:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
 ### 2. Inference
 
-Then, initialize AirLLMLlama2, pass in the huggingface repo ID of the model being used, or the local path, and inference can be performed similar to a regular transformer model.
+Then initialize `AutoModel` with a Hugging Face repo ID or a local model path.
+Generation works similarly to a regular Transformers causal language model.
 
-(*You can also specify the path to save the splitted layered model through **layer_shards_saving_path** when init AirLLMLlama2.*
+You can also set `layer_shards_saving_path` when loading the model to choose
+where AirLLM stores the split layer cache.
 
 ```python
 from airllm import AutoModel
@@ -152,6 +184,15 @@ Start the backend and production UI:
 
 Open `http://127.0.0.1:7860`.
 
+If `ui/dist` is missing or you changed the frontend, rebuild the production UI:
+
+```powershell
+cd ui
+npm install
+npm run build
+cd ..
+```
+
 The UI includes:
 
 * hardware-aware defaults for CUDA/CPU, dtype, prefetching, and sequence length
@@ -178,6 +219,17 @@ For frontend development:
 cd ui
 npm install
 npm run dev
+```
+
+Terminal client examples while the backend is running:
+
+```powershell
+.\airllm.cmd status
+.\airllm.cmd models
+.\airllm.cmd hf-search "Qwen2.5 Coder"
+.\airllm.cmd download Qwen/Qwen2.5-Coder-3B-Instruct
+.\airllm.cmd download-status
+.\airllm.cmd agent "Review this workspace and suggest performance improvements" --workspace .
 ```
 
 See [README_UI.md](README_UI.md) for the full UI, ChatUI, Coding Agent, and
@@ -252,9 +304,9 @@ When initialize the model, we support the following configurations:
 
 * **compression**: supported options: 4bit, 8bit for 4-bit or 8-bit block-wise quantization, or by default None for no compression
 * **profiling_mode**: supported options: True to output time consumptions or by default False
-* **layer_shards_saving_path**: optionally another path to save the splitted model
+* **layer_shards_saving_path**: optionally another path to save the split model cache
 * **hf_token**: huggingface token can be provided here if downloading gated models like: *meta-llama/Llama-2-7b-hf*
-* **prefetching**: prefetching to overlap the model loading and compute. By default, turned on. For now, only AirLLMLlama2 supports this.
+* **prefetching**: prefetching to overlap the model loading and compute. By default, turned on for AirLLM streaming paths where supported.
 * **cleanup_interval**: how often AirLLM runs deeper memory cleanup while streaming layers. `1` matches the original conservative behavior; `4` is the UI default for CUDA systems to reduce allocator churn.
 * **prefetch_workers**: number of background layer-load workers. `1` is usually best because layer order is sequential and avoids SSD/RAM contention.
 * **reinitialize_model_each_forward**: compatibility switch for the old behavior that rebuilt the meta model on every forward pass. Keep this `False` for speed unless a model family requires it.
