@@ -1,14 +1,14 @@
-# Core runtime
-torch>=2.5
-transformers>=4.45,<6
-accelerate>=1.0,<2
-safetensors>=0.4
-huggingface-hub>=0.26
-optimum>=1.23
-tqdm>=4.66
+# Core runtime  (floors synced to the tested venv — see CLAUDE.md)
+torch>=2.11
+transformers>=5.10,<6
+accelerate>=1.13,<2
+safetensors>=0.7
+huggingface-hub>=1.18
+optimum>=2.1
+tqdm>=4.68
 sentencepiece>=0.2
 einops>=0.8
-psutil>=6
+psutil>=7
 
 # Optional GPU compression path. On Windows/CUDA this may require a matching wheel;
 # install separately if pip cannot resolve one for your Python/CUDA version:
@@ -16,8 +16,3 @@ psutil>=6
 #
 # Optional macOS Apple Silicon fallback path for upstream AirLLM/MLX:
 #   pip install mlx
-
-# Development / evaluation helpers kept from the original project.
-evaluate>=0.4
-scikit-learn>=1.5
-wandb>=0.17

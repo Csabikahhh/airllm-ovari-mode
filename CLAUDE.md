@@ -10,7 +10,7 @@ upstream AirLLM lives under `air_llm/`.
 
 - `airllm_ui.py` — the entire backend: a single-file server built on the Python **stdlib**
   `http.server.ThreadingHTTPServer` (no Flask/FastAPI). Serves the built React app + a JSON/SSE API.
-- `ui/` — the frontend: **React 19 + Vite 7 + Tailwind 4 + shadcn-style** components (`ui/src/App.tsx`
+- `ui/` — the frontend: **React 19 + Vite 8 + Tailwind 4 + shadcn-style** components (`ui/src/App.tsx`
   is the bulk). Built output goes to `ui/dist`.
 - `air_llm/` — vendored upstream AirLLM source (the `airllm` package). `airllm_ui.py` adds it to
   `sys.path` and imports `from airllm import AutoModel` only for the streaming fallback path.
