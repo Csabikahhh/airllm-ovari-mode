@@ -235,6 +235,75 @@ Terminal client examples while the backend is running:
 See [README_UI.md](README_UI.md) for the full UI, ChatUI, Coding Agent, and
 external provider setup notes.
 
+### How the fork decides where to run your model
+
+Upstream AirLLM always streams a model layer-by-layer from disk — robust, but it
+costs *seconds per token*. This fork adds a resident fast path and picks one of
+three strategies automatically at load time (`plan_load_strategy`), based on the
+model's estimated size and your free VRAM/RAM:
+
+| Strategy | What it does | Speed | Chosen when |
+|---|---|---|---|
+| `direct_gpu` | Plain resident `transformers` model, all layers on the GPU (SDPA attention) | Fast — ~16 tok/s on a 3B, bandwidth-bound ceiling ~28 tok/s bf16 | Estimated weights fit free VRAM minus a ~1 GB reserve |
+| `direct_offload` | Resident model split across VRAM+RAM (+disk) via Accelerate `device_map="auto"` | A few tok/s — nothing is re-streamed per token | CUDA only, weights fit the combined budget `int(free_VRAM×0.8) + int(free_RAM×0.6)` GiB |
+| `airllm` | Upstream layer-by-layer disk streaming | Slowest — seconds/token | Nothing else fits, no accelerator, or compression / an AirLLM-only feature is requested |
+
+* The **default dtype** is `bfloat16` on bf16-capable GPUs (Ampere+/Blackwell) and
+  `float16` otherwise — bf16 has the same memory and speed as fp16 but a wider
+  exponent range, avoiding overflow→NaN on bf16-trained models (Qwen, Llama).
+* If a resident load fails (OOM, missing quant kernel, config error) the server
+  **falls back to AirLLM streaming** automatically, so loading never hard-fails on
+  a too-optimistic size estimate.
+* Override the choice with `load_mode`: `auto` (default), `direct`, `hybrid`
+  (force `direct_offload`), or `airllm`.
+* On an 8 GB-class GPU with no quantization libraries installed, resident bf16
+  comfortably covers ~3B models; ~4–6B models land on `direct_offload`; larger
+  ones stream via AirLLM.
+
+### HTTP and SSE API
+
+The backend is a dependency-free `http.server` app that serves the built UI plus a
+small JSON API — everything the UI does is scriptable against
+`http://127.0.0.1:7860`.
+
+**GET**
+
+| Endpoint | Returns |
+|---|---|
+| `/api/hardware` | Full hardware/software profile + recommended load settings |
+| `/api/presets` | Curated model presets and supported families |
+| `/api/providers` | External OpenAI-compatible provider presets |
+| `/api/status` | Lock-free snapshot of the loaded model (stays responsive mid-generation) |
+| `/api/models` | Locally cached HF models with sizes + current download state |
+| `/api/hf-models?q=…` | Search the Hugging Face Hub |
+| `/api/download/status` | Progress of the in-flight download |
+
+**POST** (JSON body)
+
+| Endpoint | Purpose |
+|---|---|
+| `/api/load` | Load a model (`model_id`, `device`, `dtype`, `load_mode`, `max_seq_len`, …) |
+| `/api/generate` | Single-prompt generation; `stream:true` → SSE for local models |
+| `/api/chat` | Multi-turn chat (`messages`, `system_prompt`); `stream:true` → SSE |
+| `/api/agent/run` | Read-only coding agent over a workspace |
+| `/api/unload` | Free the resident model |
+| `/api/cancel` | Cooperatively stop the running generation |
+| `/api/optimize` | Apply CPU-thread / TF32 / cuDNN tuning |
+| `/api/benchmark` | GPU/CPU matmul + cache-disk read/write micro-benchmark |
+| `/api/models/delete` | Delete a cached model |
+| `/api/download`, `/api/download/cancel` | Start / cancel a background HF download |
+
+`/api/generate` and `/api/chat` switch to **Server-Sent Events** when `stream:true`
+and the provider is local: the response opens `200` immediately and emits `data:`
+token events, so an error mid-stream arrives as a data event rather than a failed
+request. The `done` event carries real `output_tokens` and tokens/sec.
+
+```bash
+# non-streaming generation against an already-loaded model
+curl -s http://127.0.0.1:7860/api/generate \
+  -d '{"prompt":"Write a haiku about disk I/O","task_mode":"chat","max_new_tokens":64}'
+```
+
 ### Local performance changes in this fork
 
 This fork also includes runtime fixes aimed at better laptop/desktop hardware
@@ -257,10 +326,33 @@ usage:
   `bitsandbytes` is documented as optional because Windows/CUDA wheel support
   depends on the exact Python and CUDA combination.
 
+Newer resident-path levers (the model stays in memory and only what is *provably*
+worth tuning gets tuned — a disk-streaming re-load dominates everything else):
+
+* **Long context is no longer silently truncated.** Resident models size the
+  prompt budget from the model's trained context (`max_position_embeddings`,
+  capped at 32k) instead of a flat 512 tokens, so RAG / long-file / coding-agent
+  prompts keep their content. Chat trimming drops the oldest turns first and
+  preserves the system prompt.
+* **Offloaded KV cache.** When the estimated KV cache would overflow free VRAM,
+  the server streams it to CPU RAM (`cache_implementation="offloaded"`, lossless)
+  so long generations survive on 8 GB instead of OOMing; small KV stays on the
+  fast VRAM path.
+* **Prompt-lookup decoding** (n-gram speculative decode, zero extra VRAM) is on by
+  default for the greedy `code` task mode and opt-in elsewhere: ~1.5–3× faster on
+  output that quotes its context (code edits, refactors, JSON, RAG), and identical
+  output under greedy decoding.
+* **RAM-offload instead of disk-streaming.** Models that miss VRAM but fit the
+  combined VRAM+RAM budget load resident across GPU+CPU (`direct_offload`) rather
+  than dropping to per-token AirLLM streaming.
+* **Safe streaming teardown.** A cancelled or disconnected SSE stream signals
+  cancel and joins the generation worker before releasing the model lock, so an
+  orphaned `generate()` cannot pin the GPU or race the next request.
+
 Recommended defaults for this machine class:
 
 * Device: `cuda:0`
-* dtype: `float16`
+* dtype: `bfloat16` on bf16-capable GPUs (RTX 30xx+/Blackwell), else `float16`
 * compression: `none` until a compatible `bitsandbytes` wheel is installed
 * prefetching: `on`
 * cleanup interval: `4`

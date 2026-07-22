@@ -1395,6 +1395,28 @@ def estimate_model_weight_gb(config: Any, bytes_per_param: int = 2) -> Optional[
     return total_params * bytes_per_param / (1024 ** 3)
 
 
+def kv_bytes_per_token(config: Any, bytes_per_param: int = 2) -> Optional[float]:
+    """KV-cache bytes per token for a resident model: 2 (K+V) * layers * kv_dim * dtype.
+    GQA-aware (kv_dim uses num_key_value_heads). Used to size the resident context budget so
+    a long prompt's KV either fits free VRAM or triggers CPU-RAM KV offload instead of OOM.
+    Returns None if the config lacks the fields."""
+    try:
+        hidden = int(getattr(config, "hidden_size"))
+        layers = int(getattr(config, "num_hidden_layers"))
+    except Exception:
+        return None
+    if hidden <= 0 or layers <= 0:
+        return None
+    n_heads = int(getattr(config, "num_attention_heads", 0) or 0)
+    n_kv = int(getattr(config, "num_key_value_heads", n_heads) or n_heads)
+    if n_heads > 0:
+        head_dim = int(getattr(config, "head_dim", 0) or (hidden // n_heads))
+        kv_dim = head_dim * n_kv if n_kv > 0 else hidden
+    else:
+        kv_dim = hidden
+    return 2 * layers * kv_dim * bytes_per_param
+
+
 def free_vram_gb(device: str) -> Optional[float]:
     torch, _ = get_torch()
     if torch is None:
@@ -1516,17 +1538,22 @@ def plan_load_strategy(config: Dict[str, Any], dtype: Any) -> Tuple[str, Dict[st
     if est_gb is not None and vram is not None and est_gb <= max(0.0, vram - 1.0):
         info["reason"] = "fits accelerator memory"
         return "direct_gpu", info
-    # CPU/disk offload is far faster than AirLLM disk streaming, but only auto-pick it
-    # when the user explicitly asked for "direct" on CUDA (it can still be slow / thrash).
+    # CPU+GPU offload (accelerate device_map) keeps the weights RESIDENT across VRAM+RAM and
+    # runs the CPU-side layers on the otherwise-idle cores -- categorically faster than AirLLM
+    # re-streaming the ENTIRE model from disk every token (few tok/s vs seconds/token). Auto-
+    # pick it whenever the model fits the combined VRAM+RAM budget (mirrors build_direct_model's
+    # int-floored max_memory caps); load_model's OOM guard still falls back to AirLLM if the
+    # estimate was optimistic. ponytail: heuristic budget, the OOM fallback is the real net.
     if (
-        requested == "direct"
-        and str(device).startswith("cuda")
+        str(device).startswith("cuda")
         and est_gb is not None
+        and vram is not None
         and ram is not None
-        and est_gb <= max(0.0, ram - 2.0)
     ):
-        info["reason"] = "offload to RAM"
-        return "direct_offload", info
+        offload_budget = int(vram * 0.8) + int(ram * 0.6)
+        if est_gb <= offload_budget:
+            info["reason"] = f"offload GPU+RAM (est {round(est_gb, 1)} <= ~{offload_budget} GiB combined)"
+            return "direct_offload", info
     info["reason"] = "too large -> airllm/mlx streaming"
     return "airllm", info
 
@@ -1773,8 +1800,19 @@ def generation_settings(payload: Dict[str, Any], model: Any, config: Dict[str, A
         max_length = parse_int(payload.get("max_length"), prompt_budget, 16, max_model_len)
         max_length = max(16, min(max_length, max_model_len - max_new_tokens))
     else:
-        # Resident transformers models have no fixed buffer; only truncate the prompt.
-        max_length = parse_int(payload.get("max_length"), min(512, max_model_len), 16, max_model_len)
+        # Resident transformers models have no fixed KV buffer, so let the prompt use the
+        # model's REAL trained context instead of a flat 512 -- the old min(512, ...) default
+        # silently dropped everything but the last 512 prompt tokens (tokenize_prompt keeps the
+        # tail), quietly truncating RAG / long-file / coding-agent context. Clamp to the model's
+        # max_position_embeddings and a sane hard ceiling; the KV either fits VRAM or is offloaded
+        # to RAM below, so a huge context can't silently OOM. Independent of the conservative
+        # max_seq_len that sizes the AirLLM fallback buffer (left untouched on purpose).
+        cfg = getattr(model, "config", None)
+        trained = int(getattr(cfg, "max_position_embeddings", 0) or 0)
+        ctx = min(32768, trained) if trained > 0 else max_model_len
+        ctx = max(ctx, max_model_len)
+        default_budget = max(16, ctx - max_new_tokens)
+        max_length = parse_int(payload.get("max_length"), default_budget, 16, ctx)
 
     # Task-aware sampling defaults (chat / factual / code); explicit payload values win.
     task_mode = str(payload.get("task_mode") or "chat").strip().lower()
@@ -1825,6 +1863,18 @@ def generation_settings(payload: Dict[str, Any], model: Any, config: Dict[str, A
             generation_kwargs["eos_token_id"] = tok_eos
             if getattr(gen_cfg, "pad_token_id", None) is None:
                 generation_kwargs["pad_token_id"] = getattr(tok, "pad_token_id", None) or tok_eos
+
+    # Long context without OOM: if this request's KV cache would not fit the free VRAM
+    # headroom, keep it lossless by streaming KV to CPU RAM (DynamicCache offloading) instead
+    # of crashing / needing a bigger card. Small KV stays on the fast VRAM path (the check is
+    # a no-op then). Not a static cache -> does NOT trigger torch.compile (Triton absent).
+    if not is_airllm and generation_kwargs["use_cache"] and str(config["device"]).startswith("cuda"):
+        kv_pt = kv_bytes_per_token(getattr(model, "config", None))
+        free_gb = free_vram_gb(config["device"])
+        if kv_pt and free_gb is not None:
+            peak_kv_gb = kv_pt * (max_length + max_new_tokens) / (1024 ** 3)
+            if peak_kv_gb > max(0.0, free_gb - 0.5):
+                generation_kwargs["cache_implementation"] = "offloaded"
 
     # Lossless speedup on the RESIDENT path only: prompt-lookup decoding verifies several
     # context-matched candidate tokens per forward (1.5-3x on echo-heavy code/RAG/refactor
@@ -1885,8 +1935,17 @@ def run_generation(
 
         GENERATION_CANCEL.clear()
         start = time.perf_counter()
-        with torch.inference_mode():
-            output = model.generate(input_ids, **generation_kwargs)
+        try:
+            with torch.inference_mode():
+                output = model.generate(input_ids, **generation_kwargs)
+        except torch.cuda.OutOfMemoryError as exc:
+            # No fallback exists mid-generation; free the cache and return a clean, actionable
+            # error instead of a hard crash (e.g. a very long prompt whose KV overflowed VRAM).
+            empty_accelerator_cache(torch)
+            raise RuntimeError(
+                "Elfogyott a VRAM generalas kozben. Csokkentsd a prompt hosszat vagy a "
+                "max_new_tokens erteket, vagy tolts be kisebb modellt."
+            ) from exc
         elapsed = time.perf_counter() - start
         cancelled = GENERATION_CANCEL.is_set()
         GENERATION_CANCEL.clear()
@@ -2081,20 +2140,34 @@ def run_generation_stream(payload: Dict[str, Any], prompt: str, messages: Option
                 except Exception:
                     pass
             except Exception as exc:  # surfaced as a final error event
+                if torch is not None and "out of memory" in str(exc).lower():
+                    empty_accelerator_cache(torch)
                 worker_state["error"] = f"{type(exc).__name__}: {exc}"
 
         worker = threading.Thread(target=_run, daemon=True)
         worker.start()
 
         output_chars = 0
-        for chunk in streamer:
-            if chunk:
-                output_chars += len(chunk)
-                yield {"token": chunk}
-            if GENERATION_CANCEL.is_set():
-                break
+        streamed_ok = False
+        try:
+            for chunk in streamer:
+                if chunk:
+                    output_chars += len(chunk)
+                    yield {"token": chunk}
+                if GENERATION_CANCEL.is_set():
+                    break
+            streamed_ok = True
+        finally:
+            # On any teardown -- normal end, user Stop, or client disconnect (GeneratorExit
+            # thrown at the yield) -- stop and join the generate() worker BEFORE releasing
+            # MODEL_LOCK. Without this a disconnected stream leaves generate() pinning the GPU
+            # and, worse, outliving our lock hold so the next request could call generate() on
+            # the same model concurrently (KV-cache race / OOM on an 8 GB card). Reuses the
+            # cooperative StoppingCriteria the Stop button already drives.
+            if not streamed_ok and worker.is_alive():
+                GENERATION_CANCEL.set()
+            worker.join()
 
-        worker.join()
         elapsed = time.perf_counter() - start
         cancelled = GENERATION_CANCEL.is_set()
         GENERATION_CANCEL.clear()
